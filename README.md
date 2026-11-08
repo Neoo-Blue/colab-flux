@@ -11,7 +11,10 @@ Colab compute units.
 - **Learns your taste**: tell the agent what you like and dislike, and it refines your brand profile
 - **Two sizes per shot**: high definition PNG (about 4 MP, e.g. 2048x2048) and a medium JPEG
   (1024 px) for listings and social
-- **Nothing left running**: one command = one GPU lifetime, with a watchdog as a safety net
+- **Best of several, judged**: each shot is rendered up to 3 times and a vision model on the same GPU
+  keeps the best (it catches bad hands, duplicated objects, a changed product, stray text)
+- **Warm for follow-ups, then off**: the GPU stays loaded for 5 minutes (`fluxx config keep_minutes N`)
+  so "one more" starts at once, then a watchdog shuts it down
 
 ## Install
 
@@ -40,10 +43,10 @@ Runs on macOS and Linux; on Windows, inside WSL2 (`wsl --install -d Ubuntu`).
 | | Why | Cost |
 |---|---|---|
 | A Google account with **Colab Pro** or compute units | the A100 GPU | Colab Pro is about $10/month with 100 compute units |
-| A free **Hugging Face** account, with the [FLUX 3 license](https://huggingface.co/black-forest-labs/flux-3-image-klein) accepted and a Read token | the model weights are gated | free |
+| Optional: a free **Hugging Face** account with the [FLUX 3 license](https://huggingface.co/black-forest-labs/flux-3-image-klein) accepted | the official weights are gated; without a token fluxx uses a public mirror whose weight files it checks against the official sha256 on every run | free |
 
-`fluxx login` walks through both: a browser opens for Google, then it shows the two Hugging Face
-links and asks for the token at a hidden prompt. `fluxx doctor` shows what is still missing.
+`fluxx login` walks through both: a browser opens for Google, then (optionally) it shows the two
+Hugging Face links and asks for the token at a hidden prompt. `fluxx doctor` shows what is still missing.
 
 ## Use
 
@@ -67,11 +70,12 @@ fluxx rate 01-the-jar-on-a-sunlit-windowsill-v1 good "love the light"
 ## How it works
 
 `fluxx gen` starts an A100 80 GB on Colab, uploads `remote_job.py`, your product photos and the
-shot list, and starts the job: install diffusers, download FLUX 3 Image Klein (~11 GB), its
-Qwen3-VL text encoder and its 9B prompt upsampler (~19 GB), then render every shot with the
-references and a fixed seed. `fluxx` polls progress, downloads the zipped pictures, and stops the
-GPU in a `finally` block. A detached watchdog stops it after `--max-minutes` even if `fluxx` is
-killed. Your token is uploaded to your own VM as a file, read, and deleted; it never appears in
+shot list, and starts a worker: install diffusers, download FLUX 3 Image Klein (~11 GB), its
+Qwen3-VL text encoder, its 9B prompt upsampler and the Qwen3.5-9B judge (~60 GB in all, about 3
+minutes on Colab), then render every shot with the references and a fixed seed, judge each
+candidate, keep the best. `fluxx` polls progress and downloads the zipped pictures. The worker
+stays loaded for `--keep` minutes so a follow-up run skips startup; a detached watchdog stops the
+GPU after that (and on any failure at once), even if `fluxx` is killed. Your token is uploaded to your own VM as a file, read, and deleted; it never appears in
 code or logs.
 
 ## License

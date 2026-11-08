@@ -1,14 +1,14 @@
 ---
 name: colab-flux
-description: Consistent product and brand pictures with FLUX 3 Image Klein (Black Forest Labs, open weights) on a Google Colab GPU that is started for the job and stopped right after, via the fluxx CLI. Use when someone wants product shots, catalog or listing images, lifestyle scenes, social posts or ad visuals that look like the same brand every time - the same product, the same light, the same feel - without paying per image to an image API. Each business gets a brand profile (what they sell, their look, what to avoid, reference photos of the product) that learns from their good/bad feedback. Outputs a high-definition PNG (~4 MP) and a medium JPEG (1024 px) per shot. Also covers first-time setup (Google sign-in for Colab, Hugging Face license and token), changing a brand's style, and the fluxx commands. Invocable as /colab-flux.
+description: Consistent product and brand pictures with FLUX 3 Image Klein (Black Forest Labs, open weights) on a Google Colab GPU that is started for the job and stopped right after, via the fluxx CLI. Use when someone wants product shots, catalog or listing images, lifestyle scenes, social posts or ad visuals that look like the same brand every time - the same product, the same light, the same feel - without paying per image to an image API. Each business gets a brand profile (what they sell, their look, what to avoid, reference photos of the product) that learns from their good/bad feedback. Renders several candidates per shot and an on-GPU judge keeps the best; outputs a high-definition PNG (~4 MP) and a medium JPEG (1024 px) per shot; keeps the GPU warm a few minutes for follow-ups. Also covers first-time setup (Google sign-in for Colab, Hugging Face license and token), changing a brand's style, and the fluxx commands. Invocable as /colab-flux.
 ---
 
 # colab-flux
 
-FLUX 3 Image Klein on a rented Colab GPU, driven by `fluxx`. One `fluxx gen` = one GPU lifetime:
-start an A100 -> install diffusers -> download and load FLUX 3 -> render every shot -> download
-the pictures -> stop the GPU. Nothing stays running between jobs, so batch every shot you can
-into one call.
+FLUX 3 Image Klein on a rented Colab GPU, driven by `fluxx`. A `fluxx gen` starts an A100 ->
+installs diffusers -> downloads and loads FLUX 3 and a judge model -> renders every shot (best of
+several, judged) -> downloads the pictures -> keeps the GPU warm for a few minutes for follow-ups,
+then stops it. Batch every shot you can into one call.
 
 What makes the pictures consistent is the **brand profile**, not luck:
 
@@ -33,7 +33,7 @@ Run `fluxx doctor` (if `fluxx` is not found, run `sh <this skill's folder>/insta
 | Colab CLI not installed | nothing: you run `sh install.sh` from this skill's folder | installs `uv` and the official Colab CLI |
 | not signed in to Google | runs `fluxx login` **in their own terminal** | a browser opens for Google sign-in. You cannot do this for them |
 | compute units | buys Colab Pro or compute units at https://colab.research.google.com/signup | the A100 is not on the free tier |
-| Hugging Face token / license | in the same `fluxx login`: opens the FLUX 3 page, clicks agree, creates a Read token, pastes it at the hidden prompt | free. Never ask them to paste the token into the chat |
+| Hugging Face (optional) | nothing by default: without a token fluxx downloads from a public mirror after checking every weight file's sha256 against the official repo. For the official repo: `fluxx login` opens the FLUX 3 page, they click agree, create a Read token and paste it at the hidden prompt | free. Never ask them to paste the token into the chat |
 | no brands | nothing: you do the brand interview below | |
 
 `fluxx login` asks for the token with a hidden prompt, so it needs a real terminal: in Claude Code
@@ -79,14 +79,35 @@ Show the person the profile you wrote (`fluxx brand show NAME`) and ask if it so
    fluxx gen -b acme-candles -n 2 "scene one" "scene two" "scene three"
    fluxx gen -b acme-candles --from shots.txt          # one scene per line, # comments ok
    ```
-   It takes several minutes. In Claude Code run it with `run_in_background`; in Codex let it run.
-   It prints one picture path per line on stdout. Progress and the compute-unit cost go to stderr.
-4. Look at the `_md.jpg` files yourself before presenting (they are small). Reject shots where the
-   product changed shape, the label is garbled, or something from the avoid list slipped in, and
-   say so. Then give the person the folder and the paths.
+   A scene can set its own shape with a prefix, so one run can mix formats:
+   `16:9 | the jar on a sunlit windowsill, space on the left for a headline`.
+   A cold start takes ~4 minutes, then ~45 s per 4 MP render. In Claude Code run it with
+   `run_in_background`; in Codex let it run. It prints one picture path per line on stdout;
+   progress, each shot's judge score and defects, and the compute-unit cost go to stderr.
+   When a person is in a scene using the product, say how: "holding the phone's handset to her
+   ear, its cord trailing out of frame; the phone base not visible". FLUX draws the product the way
+   the reference shows it, so a lifted part tends to appear twice (in testing, a held handset plus
+   one still on the phone, even when the prompt said the cradle was empty). Framing the rest of the
+   product out of the picture fixed it.
+4. **Best of N, judged on the GPU.** Each shot renders up to `--candidates` images (default 3).
+   A vision-language judge (Qwen3.5-9B, on the same GPU) checks each against the brief, the product
+   references and the avoid list (anatomy, duplicated objects, product fidelity, stray text,
+   appeal), keeps the best, and stops early when one scores 9+ with no defects. The others come
+   back small in `alts/`, so the person can still pick one.
+5. Look at the `_md.jpg` files yourself too (they are small), especially any shot whose stderr line
+   lists defects or scores below 7. Say what is wrong with it rather than presenting it as done.
+   Then give the person the folder and the paths.
+6. **The GPU stays warm afterwards** (`--keep`, default 5 minutes) with the models loaded, so a
+   follow-up `fluxx gen` with the same setup starts rendering at once instead of after ~4 minutes.
+   Right after presenting, ask: "The GPU is still warm for N minutes (about X compute units if it
+   sits idle). Want more or changes? Otherwise I'll shut it down." If they are done, run
+   `fluxx stop`. If they say nothing, it stops by itself. If they ask to keep it longer, pass
+   `--keep 15` on the next run, or save a new default with `fluxx config keep_minutes 15`.
+   `--keep 0` stops the GPU at the end of the run.
 
-Flags: `-n N` variations per scene (seeds seed..seed+N-1) · `--draft` 1 MP medium only, faster,
-for exploring a new direction · `--aspect W:H` · `--ref PATH` one-off extra product photo ·
+Flags: `-n N` variations per scene (seeds seed..seed+N-1) · `--candidates K` renders per shot, best
+kept (1-8) · `--keep MIN` warm minutes afterwards · `--draft` 1 MP medium only, one candidate,
+faster, for exploring a new direction · `--aspect W:H` · `--ref PATH` one-off extra product photo ·
 `--no-refs` · `--seed S` · `--no-upsample` when the scenes are already full captions (skips a
 19 GB download) · `--out DIR`.
 
@@ -104,7 +125,10 @@ fluxx rate 03-jar-in-bathroom-v2 bad "too busy, the towel steals focus"
 
 When two or more ratings point the same way, edit `brand.json` (it is plain JSON; edit it with
 your file tools): sharpen `style`, extend `avoid`, add a dated line to `notes` saying what changed
-and why. Tell the person in one line ("I added 'low morning light' to your style and dropped
+and why. When the same **defect** comes back (a doubled part, a wrong color, a missing label),
+add a one-line rule to `checks`, e.g. `"Exactly one telephone handset in the whole picture"`.
+The judge then counts and verifies that rule on every candidate from now on; a general score
+alone missed exactly this kind of defect in testing. Tell the person in one line ("I added 'low morning light' to your style and dropped
 props near the jar"). A shot they love can become a style reference:
 `fluxx brand ref NAME <path>_hd.png --role style` (references are capped at 10 in total; FLUX 3
 treats style references as look only, not content).
@@ -117,10 +141,11 @@ create another brand with the same product references instead of overwriting.
 
 ## Rules
 
-- **One call, many shots.** Never loop `fluxx gen` per picture. Startup (GPU, ~40 GB model
-  download, loading) is most of the time and cost of a run.
-- **The GPU always stops.** `fluxx` stops it in a `finally` block and a watchdog stops it after
-  `--max-minutes` (default 60) even if `fluxx` is killed. If a run ends with
+- **One call, many shots.** Never loop `fluxx gen` per picture. A cold start (GPU, ~60 GB of models,
+  loading) costs ~4 minutes. Follow-ups inside the warm window skip it.
+- **The GPU always stops.** On failure `fluxx` stops it at once. On success it stays warm for
+  `--keep` minutes and a detached watchdog then stops it, even if `fluxx` or the agent is gone.
+  During a run the watchdog caps it at `--max-minutes` (default 60). If a run ends with
   `NOT CONFIRMED STOPPED`, run `fluxx stop` then `fluxx status` immediately.
 - **No secrets in chat.** The Hugging Face token is typed into `fluxx login`'s hidden prompt only.
   It travels to the person's own Colab VM, which deletes it from disk once read and is wiped on stop.
@@ -136,12 +161,13 @@ create another brand with the same product references instead of overwriting.
 fluxx doctor                       # what is set up, what is missing
 fluxx login                        # Google sign-in + Hugging Face token (person runs it, needs a terminal)
 fluxx brand new|show|list|ref ...  # brand profiles
-fluxx gen -b NAME [...] scenes...  # render, one GPU lifetime
+fluxx gen -b NAME [...] scenes...  # render (reuses a warm GPU)
 fluxx rate SHOT good|bad "why"     # feedback
+fluxx config [keep_minutes|candidates N]   # defaults: 5 warm minutes, 3 candidates
 fluxx status                       # Colab sessions and compute-unit balance
 fluxx stop                         # stop a leftover GPU session (always safe)
 fluxx selftest                     # offline check, no Colab call
 ```
 
 Environment: `COLAB_FLUX_HOME` (default `~/colab-flux`), `FLUXX_GPU` (default `A100`, the 80 GB
-card; the model plus upsampler need about 40 GB), `FLUXX_MODEL`, `HF_TOKEN`.
+card: FLUX 3, its prompt upsampler and the judge use about 60 GB), `FLUXX_MODEL`, `FLUXX_MIRROR` (empty disables the mirror), `HF_TOKEN`.

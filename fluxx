@@ -34,6 +34,7 @@ import os
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import tempfile
 import time
@@ -43,6 +44,9 @@ import zipfile
 from pathlib import Path
 
 MODEL = os.environ.get("FLUXX_MODEL", "black-forest-labs/flux-3-image-klein")
+# Used when there is no Hugging Face token with the license accepted. Same files, byte for byte:
+# fluxx compares every weight file's sha256 with the official listing before each run.
+MIRROR = os.environ.get("FLUXX_MIRROR", "unsloth/flux-3-image-klein")
 HOME = Path(os.environ.get("COLAB_FLUX_HOME", Path.home() / "colab-flux"))
 STATE = Path.home() / ".cache" / "colab-flux"
 HF_TOKEN_FILE = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "token"
@@ -53,7 +57,8 @@ BEGIN, END = "<<<FLUXX_BEGIN>>>", "<<<FLUXX_END>>>"
 MAX_REFS = 10
 HD_MP, DRAFT_MP, MD_SIDE = 4.0, 1.0, 1024
 ROLES = {
-    "product": "the product: keep it exactly as shown, same shape, label, text, colors and proportions",
+    "product": ("the product: keep its design identical (shape, colors, materials, label and details), but it is a real "
+                "object that can be posed and used naturally in the scene, e.g. picked up, opened or with a part lifted"),
     "style": "a style reference: match its lighting, palette, framing and mood, not its contents",
 }
 
@@ -178,19 +183,35 @@ def rexec(session: str, code: str, timeout: float = 90) -> dict:
 
 
 LAUNCH = f'''
-import os, subprocess
-os.makedirs("{REMOTE}/refs", exist_ok=True)
-subprocess.Popen(["sh", "-c", "python3 {REMOTE}/remote_job.py > {REMOTE}/job.log 2>&1"], start_new_session=True)
+import subprocess
+subprocess.Popen(["sh", "-c", "python3 {REMOTE}/remote_job.py > {REMOTE}/worker.log 2>&1"], start_new_session=True)
 print(BEGIN); print("{{}}"); print(END)
 '''
+# JOB is prepended. The job's own progress once the worker picked it up, the worker's setup stage before that.
 POLL = f'''
 import os
-p = "{REMOTE}/progress.json"
-st = json.load(open(p)) if os.path.exists(p) else {{"stage": "starting"}}
-if st.get("stage") == "failed":
-    st["log"] = open("{REMOTE}/job.log", errors="replace").read()[-3000:]
+def _read(p):
+    return json.load(open(p)) if os.path.exists(p) else None
+st = _read(JOB + "/progress.json") or _read("{REMOTE}/progress.json") or {{"stage": "starting"}}
+if st.get("stage") in ("ready", "starting") and not os.path.exists(JOB + "/progress.json"):
+    st = dict(st, stage="queued")
+if st.get("stage") == "failed" and os.path.exists("{REMOTE}/worker.log"):
+    st["log"] = open("{REMOTE}/worker.log", errors="replace").read()[-3000:]
+w = _read("{REMOTE}/progress.json") or {{}}
+st["ready_s"], st["note"] = w.get("ready_s"), w.get("note")
 print(BEGIN); print(json.dumps(st)); print(END)
 '''
+HEARTBEAT = f'''
+import os, time
+p = "{REMOTE}/heartbeat"
+print(BEGIN); print(json.dumps({{"age": time.time() - float(open(p).read()) if os.path.exists(p) else 1e9}})); print(END)
+'''
+CONFIG_DEFAULTS = {"keep_minutes": 5, "candidates": 3}
+
+
+def config() -> dict:
+    p = HOME / "config.json"
+    return {**CONFIG_DEFAULTS, **(json.loads(p.read_text()) if p.exists() else {})}
 
 
 def _kill_watchdog(session: str) -> None:
@@ -206,9 +227,40 @@ def _raise_interrupt(signum, _frame):
     raise KeyboardInterrupt(f"signal {signum}")
 
 
+def warm_file(session: str) -> Path:
+    return STATE / f"warm-{session}.json"
+
+
+def arm_watchdog(session: str, seconds: float) -> None:
+    """(Re)start the detached timer that stops the GPU, whatever happens to this process."""
+    _kill_watchdog(session)
+    wd = subprocess.Popen(["sh", "-c", f"sleep {int(seconds)}; colab stop -s {session}; rm -f '{warm_file(session)}'"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                          env=colab_env())
+    (STATE / f"watchdog-{session}.pid").write_text(str(wd.pid))
+
+
+def warm_alive(session: str, mode: dict) -> bool:
+    """A GPU kept warm by an earlier run, with the same model setup, whose worker is still beating."""
+    p = warm_file(session)
+    try:
+        w = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return False
+    if w.get("mode") != mode or w.get("until", 0) < time.time() + 30:
+        return False
+    if f"[{session}]" not in colab("sessions", check=False, timeout=60).stdout:
+        return False
+    try:
+        return rexec(session, HEARTBEAT, 60)["age"] < 60
+    except FluxxError:
+        return False
+
+
 @contextlib.contextmanager
-def gpu_session(args):
-    """One GPU for the duration of the block, always stopped afterwards. Yields a dict for the CU rate."""
+def gpu_session(args, mode: dict):
+    """A GPU for the block: a warm one from an earlier run when it matches, else a new one. Afterwards it is
+    stopped, or on success with --keep N kept warm for N minutes under a watchdog. Yields {rate, warm, keep}."""
     if not shutil.which("colab"):
         raise FluxxError("Colab CLI not installed: run install.sh, or `uv tool install google-colab-cli`")
     STATE.mkdir(parents=True, exist_ok=True)
@@ -217,47 +269,61 @@ def gpu_session(args):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise FluxxError(f"another fluxx run holds session '{args.session}'; wait, or use -s NAME")
-    _kill_watchdog(args.session)
-    colab("stop", "-s", args.session, check=False, timeout=90)
-    wd = subprocess.Popen(["sh", "-c", f"sleep {int(args.max_minutes * 60)}; colab stop -s {args.session}"],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                          env=colab_env())
-    (STATE / f"watchdog-{args.session}.pid").write_text(str(wd.pid))
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _raise_interrupt)
-    t0, info = time.time(), {}
+    t0, info = time.time(), {"warm": warm_alive(args.session, mode)}
+    warm_file(args.session).unlink(missing_ok=True)  # in use now; written again only if kept warm after
+    arm_watchdog(args.session, args.max_minutes * 60)
     try:
-        log(f"allocating {args.gpu} as session '{args.session}' (watchdog stops it at {args.max_minutes:g} min)")
-        hm = args.high_mem and args.gpu.upper() in ("A100", "T4")
-        colab("new", "-s", args.session, "--gpu", args.gpu, *(["--high-mem"] if hm else []), timeout=600)
-        log(f"VM up in {time.time() - t0:.0f}s")
+        if info["warm"]:
+            log(f"reusing the warm GPU '{args.session}': FLUX 3 is already loaded")
+        else:
+            colab("stop", "-s", args.session, check=False, timeout=90)
+            log(f"allocating {args.gpu} as session '{args.session}' (watchdog stops it at {args.max_minutes:g} min)")
+            hm = args.high_mem and args.gpu.upper() in ("A100", "T4")
+            colab("new", "-s", args.session, "--gpu", args.gpu, *(["--high-mem"] if hm else []), timeout=600)
+            log(f"VM up in {time.time() - t0:.0f}s")
         m = re.search(r"Usage rate:\s*([\d.]+)", colab("usage", check=False, timeout=60).stdout)
         info["rate"] = float(m.group(1)) if m else None
         yield info
     finally:
         signal.signal(signal.SIGINT, signal.SIG_IGN)  # nothing may interrupt the stop
-        stopped = False
-        for attempt in range(3):
-            if colab("stop", "-s", args.session, check=False, timeout=120).returncode == 0:
-                stopped = True
-                break
-            time.sleep(2 ** attempt)
-        if not stopped:
-            r = colab("sessions", check=False, timeout=60)
-            stopped = r.returncode == 0 and f"[{args.session}]" not in r.stdout
-        if stopped:
-            _kill_watchdog(args.session)
-        else:
-            log(f"WARNING: could not confirm the stop; the watchdog is still armed. Run `fluxx status` now.")
-        mins = (time.time() - t0) / 60
         rate = info.get("rate")
+        mins = (time.time() - t0) / 60
         cost = f" ~{rate * mins / 60:.2f} compute units at {rate:g}/h" if rate else ""
-        log(f"session {'stopped' if stopped else 'NOT CONFIRMED STOPPED'} after {mins:.1f} min{cost}")
+        if info.get("keep") and args.keep > 0:
+            arm_watchdog(args.session, args.keep * 60)
+            warm_file(args.session).write_text(json.dumps({"mode": mode, "until": time.time() + args.keep * 60}))
+            idle = f", ~{rate * args.keep / 60:.2f} more if it sits idle" if rate else ""
+            log(f"this run took {mins:.1f} min{cost}")
+            log(f"GPU KEPT WARM for {args.keep:g} min{idle}: the next `fluxx gen` with the same setup starts "
+                f"rendering at once. `fluxx stop` releases it now; otherwise it stops by itself.")
+        else:
+            stopped = False
+            for attempt in range(3):
+                if colab("stop", "-s", args.session, check=False, timeout=120).returncode == 0:
+                    stopped = True
+                    break
+                time.sleep(2 ** attempt)
+            if not stopped:
+                r = colab("sessions", check=False, timeout=60)
+                stopped = r.returncode == 0 and f"[{args.session}]" not in r.stdout
+            if stopped:
+                _kill_watchdog(args.session)
+            else:
+                log(f"WARNING: could not confirm the stop; the watchdog is still armed. Run `fluxx status` now.")
+            log(f"session {'stopped' if stopped else 'NOT CONFIRMED STOPPED'} after {mins:.1f} min{cost}")
         signal.signal(signal.SIGINT, signal.default_int_handler)
         lock.close()
 
 
 # ---------------------------------------------------------------- accounts
+
+def urlopen(req, timeout: float = 30):
+    """HTTPS with the CA bundle colab_env() found: python.org / uv Pythons on macOS ship without one."""
+    ctx = ssl.create_default_context(cafile=colab_env().get("SSL_CERT_FILE"))
+    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
 
 def hf_token() -> str | None:
     tok = os.environ.get("HF_TOKEN") or (HF_TOKEN_FILE.read_text().strip() if HF_TOKEN_FILE.exists() else "")
@@ -271,7 +337,7 @@ def hf_access(tok: str) -> str:
     for path in ("model_index.json", "modular_model_index.json"):
         req.full_url = f"https://huggingface.co/{MODEL}/resolve/main/{path}"
         try:
-            urllib.request.urlopen(req, timeout=20)
+            urlopen(req, timeout=20)
             return "ok"
         except urllib.error.HTTPError as e:
             if e.code == 401:
@@ -279,6 +345,35 @@ def hf_access(tok: str) -> str:
             if e.code == 403:
                 return "license"
     return "ok"  # 404 on both names means access was granted but the layout changed: let the VM try
+
+
+def weight_hashes(repo: str) -> dict:
+    url = f"https://huggingface.co/api/models/{repo}?blobs=true"
+    with urlopen(url) as r:
+        sib = json.load(r).get("siblings", [])
+    return {s["rfilename"]: s["lfs"]["sha256"] for s in sib
+            if s.get("lfs") and re.match(r"(transformer|text_encoder|vae)/.*\.safetensors$", s["rfilename"])}
+
+
+def mirror_matches() -> bool:
+    """True when every weight file in the mirror has the official file's sha256 (both listings are public)."""
+    try:
+        official, mirror = weight_hashes(MODEL), weight_hashes(MIRROR)
+    except (OSError, ValueError, KeyError):
+        return False
+    return bool(official) and official == mirror
+
+
+def pick_source() -> tuple[str, str | None]:
+    """(repo to download from, token to upload or None)."""
+    tok = hf_token()
+    if tok and hf_access(tok) == "ok":
+        return MODEL, tok
+    if MIRROR and mirror_matches():
+        log(f"no Hugging Face token with FLUX 3 access: using the public mirror {MIRROR} "
+            f"(weights verified identical to {MODEL}; the FLUX license applies the same)")
+        return MIRROR, None
+    raise FluxxError(f"no access to {MODEL} and the mirror could not be verified: run `fluxx login`")
 
 
 def cmd_login(_args) -> int:
@@ -334,8 +429,11 @@ def cmd_doctor(_args) -> int:
             "buy compute units or Colab Pro: https://colab.research.google.com/signup")
     tok = hf_token()
     state = hf_access(tok) if tok else "none"
-    row(state == "ok", "Hugging Face token with FLUX 3 license accepted",
-        "fluxx login" if state in ("none", "token") else f"accept the license at https://huggingface.co/{MODEL}")
+    if state == "ok":
+        row(True, "Hugging Face token with FLUX 3 license accepted (official weights)")
+    else:
+        row(mirror_matches(), f"model: public mirror {MIRROR}, verified identical (optional: `fluxx login` "
+                              f"for the official repo)", "fluxx login (the mirror could not be verified)")
     brands = sorted(p.parent.name for p in (HOME / "brands").glob("*/brand.json"))
     row(bool(brands), f"brands: {', '.join(brands) or 'none'}", "fluxx brand new NAME (the skill walks you through it)")
     print("\n".join(rows))
@@ -358,7 +456,7 @@ def cmd_brand(args) -> int:
         (d / "refs").mkdir(parents=True, exist_ok=True)
         save_brand(args.name, {"business": args.business or "", "style": args.style or "",
                                "avoid": args.avoid or "", "aspect": args.aspect or "1:1",
-                               "seed": int.from_bytes(os.urandom(3), "big"), "refs": [], "notes": []})
+                               "seed": int.from_bytes(os.urandom(3), "big"), "refs": [], "checks": [], "notes": []})
         print(d / "brand.json")
         return 0
     b = load_brand(args.name)
@@ -418,12 +516,14 @@ def plan_shots(args, brand: dict) -> tuple[list[dict], list[dict]]:
     for r in refs:
         if not Path(r["path"]).is_file():
             raise FluxxError(f"reference image missing: {r['path']}")
-    aspect = args.aspect or brand.get("aspect") or "1:1"
-    w, h = size_for(aspect, DRAFT_MP if args.draft else HD_MP)
     seed = args.seed if args.seed is not None else int(brand.get("seed", 0))
-    remote = {r["path"]: f"{REMOTE}/refs/{i}{Path(r['path']).suffix.lower()}" for i, r in enumerate(refs)}
+    remote = {r["path"]: f"refs/{i}{Path(r['path']).suffix.lower()}" for i, r in enumerate(refs)}  # inside the job dir
     shots = []
     for i, scene in enumerate(scenes):
+        m = re.match(r"\s*(\d+(?:\.\d+)?:\d+(?:\.\d+)?)\s*\|\s*(.+)", scene)  # "16:9 | scene" sets its aspect
+        aspect = m.group(1) if m else args.aspect or brand.get("aspect") or "1:1"
+        scene = m.group(2) if m else scene
+        w, h = size_for(aspect, DRAFT_MP if args.draft else HD_MP)
         for k in range(args.n):
             shots.append({"id": f"{i + 1:02d}-{slug(scene)}-v{k + 1}", "scene": scene,
                           "request": compose(scene, brand, refs), "seed": seed + k, "width": w, "height": h,
@@ -433,55 +533,69 @@ def plan_shots(args, brand: dict) -> tuple[list[dict], list[dict]]:
 
 def cmd_gen(args) -> int:
     brand = load_brand(args.brand)
+    cfg = config()
+    args.keep = cfg["keep_minutes"] if args.keep is None else args.keep
+    if args.candidates is None:
+        args.candidates = 1 if args.draft else int(cfg["candidates"])
     shots, uploads = plan_shots(args, brand)
-    tok = hf_token()
-    if not tok:
-        raise FluxxError("no Hugging Face token: run `fluxx login`")
-    if (state := hf_access(tok)) != "ok":
-        raise FluxxError("Hugging Face token rejected: run `fluxx login`" if state == "token" else
-                         f"accept the FLUX 3 license first: https://huggingface.co/{MODEL}")
+    source, tok = pick_source()
     out = Path(args.out).expanduser() if args.out else brand_dir(args.brand) / "shots" / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
-    spec = {"model": MODEL, "upsample": not args.no_upsample, "md_side": MD_SIDE, "shots": shots}
-    log(f"{len(shots)} shot(s) at {shots[0]['width']}x{shots[0]['height']}, {len(uploads)} reference(s) -> {out}")
+    mode = {"model": MODEL, "source": source, "upsample": not args.no_upsample, "judge": True}
+    spec = {"md_side": MD_SIDE, "candidates": args.candidates, "avoid": brand.get("avoid", ""),
+            "checks": brand.get("checks", []), "shots": shots}
+    sizes = sorted({f"{s['width']}x{s['height']}" for s in shots})
+    log(f"{len(shots)} shot(s) at {', '.join(sizes)}, up to {args.candidates} candidate(s) each, judged; "
+        f"{len(uploads)} reference(s) -> {out}")
 
-    with tempfile.TemporaryDirectory() as tmp, gpu_session(args) as info:
-        sp, tp = Path(tmp) / "spec.json", Path(tmp) / "hf_token"
-        sp.write_text(json.dumps(spec))
-        tp.write_text(tok)
-        tp.chmod(0o600)
-        rexec(args.session, f'import os\nos.makedirs("{REMOTE}/refs", exist_ok=True)\n'
+    job = f"{REMOTE}/jobs/j{time.time_ns()}"
+    with tempfile.TemporaryDirectory() as tmp, gpu_session(args, mode) as info:
+        rexec(args.session, f'import os\nos.makedirs("{job}/refs", exist_ok=True)\n'
                             'print(BEGIN); print("{}"); print(END)', 60)
-        for local, remote in [(str(HERE / "remote_job.py"), f"{REMOTE}/remote_job.py"),
-                              (str(sp), f"{REMOTE}/spec.json"), (str(tp), f"{REMOTE}/hf_token")] + \
-                             [(u["local"], u["remote"]) for u in uploads]:
+        files = [(u["local"], f"{job}/{u['remote']}") for u in uploads]
+        if not info["warm"]:
+            wp = Path(tmp) / "worker.json"
+            wp.write_text(json.dumps({**mode, "idle_exit_s": 6 * 3600}))  # the VM itself is stopped by the watchdog
+            files += [(str(HERE / "remote_job.py"), f"{REMOTE}/remote_job.py"), (str(wp), f"{REMOTE}/worker.json")]
+            if tok:
+                tp = Path(tmp) / "hf_token"
+                tp.write_text(tok)
+                tp.chmod(0o600)
+                files.append((str(tp), f"{REMOTE}/hf_token"))
+        sp = Path(tmp) / "spec.json"
+        sp.write_text(json.dumps(spec))
+        files.append((str(sp), f"{job}/spec.json"))  # last: the worker starts a job once its spec exists
+        for local, remote in files:
             colab("upload", "-s", args.session, local, remote, timeout=300)
-        rexec(args.session, LAUNCH, 60)
-        log("job started on the VM: installing, downloading FLUX 3 Klein (~40 GB) and loading it")
+        if not info["warm"]:
+            rexec(args.session, LAUNCH, 60)
+            log("worker started: installing, downloading FLUX 3 Klein and the judge, loading them (~3-4 min)")
         last, misses, deadline = None, 0, time.time() + args.max_minutes * 60 - 120
         while time.time() < deadline:
-            time.sleep(15)
+            time.sleep(10)
             try:
-                st = rexec(args.session, POLL, 60)
+                st = rexec(args.session, f"JOB = {job!r}\n" + POLL, 60)
                 misses = 0
             except FluxxError:
                 misses += 1  # a dropped websocket: try again
                 if misses >= 8:
                     raise
                 continue
-            line = st["stage"] + (f" {st['done']}/{st['total']}" if "total" in st else "")
+            line = st["stage"] + (f" {st['done'] + (st['stage'] != 'finished')}/{st['total']}" if "total" in st else "") \
+                + (f" candidate {st['candidate']}/{st['of']}" if st.get("of", 1) > 1 else "")
             if line != last:
-                log(line + (f" (model ready after {st['ready_s']}s)" if st.get("ready_s") and st.get("done") == 0 else ""))
+                log(line)
                 last = line
             if st["stage"] == "failed":
-                raise FluxxError("the job failed on the VM:\n" + (st.get("log") or st.get("error", "")))
+                raise FluxxError("the job failed on the VM:\n" + (st.get("error") or "") + (st.get("log") or ""))
             if st["stage"] == "finished":
+                info["ready_s"], info["note"] = st.get("ready_s"), st.get("note")
                 break
         else:
             raise FluxxError(f"not finished within --max-minutes {args.max_minutes:g}; nothing downloaded")
         zp = Path(tmp) / "out.zip"
         for attempt in range(3):
-            if colab("download", "-s", args.session, f"{REMOTE}/out.zip", str(zp), check=False, timeout=900).returncode == 0 \
+            if colab("download", "-s", args.session, f"{job}/out.zip", str(zp), check=False, timeout=900).returncode == 0 \
                     and zipfile.is_zipfile(zp):
                 break
             time.sleep(3)
@@ -489,13 +603,16 @@ def cmd_gen(args) -> int:
             raise FluxxError("could not download the pictures from the VM")
         with zipfile.ZipFile(zp) as z:
             z.extractall(out)
+        info["keep"] = True
 
     manifest = json.loads((out / "manifest.json").read_text())
     now, recs, failed = time.strftime("%Y-%m-%dT%H:%M:%S"), [], 0
     by_id = {s["id"]: s for s in shots}
     for r in manifest["shots"]:
-        rec = {"id": r["id"], "time": now, "scene": r["scene"], "caption": r.get("caption", ""), "seed": r["seed"],
-               "aspect": by_id[r["id"]]["aspect"], "size": f"{r['width']}x{r['height']}"}
+        rec = {"id": r["id"], "time": now, "scene": r["scene"], "caption": r.get("caption", ""), "seed": r.get("seed"),
+               "aspect": by_id[r["id"]]["aspect"], "size": f"{r['width']}x{r['height']}",
+               "score": r.get("score"), "defects": r.get("defects", []),
+               "alts": [str(out / c["alt"]) for c in r.get("candidates", []) if c.get("alt")]}
         for k in ("hd", "md"):
             if r.get(k):
                 rec[k] = str(out / r[k])
@@ -506,16 +623,33 @@ def cmd_gen(args) -> int:
         recs.append(rec)
         if "md" in rec:
             print(rec.get("hd") or rec["md"])
+            tried = len(r.get("candidates", [])) or 1
+            judged = f"score {rec['score']}/10" if rec["score"] is not None else "not judged"
+            log(f"{r['id']}: {judged}, best of {tried}" + (f"; defects: {'; '.join(rec['defects'])}" if rec["defects"] else ""))
     append_history(args.brand, recs)
-    log(f"{len(recs) - failed}/{len(recs)} pictures on {manifest.get('gpu', '?')}, model ready after "
-        f"{manifest.get('ready_s', '?')}s -> {out}")
+    log(f"{len(recs) - failed}/{len(recs)} pictures in {manifest.get('job_s', '?')}s on {manifest.get('gpu', '?')}"
+        + (f", model ready after {info['ready_s']}s" if not info["warm"] and info.get("ready_s") else "")
+        + (f" ({info['note']})" if info.get("note") else "") + f" -> {out}")
     return 1 if failed else 0
+
+
+def cmd_config(args) -> int:
+    cfg = config()
+    if args.key and args.value is not None:
+        if args.value < 0 or (args.key == "candidates" and not 1 <= args.value <= 8):
+            raise FluxxError("keep_minutes >= 0; candidates 1..8")
+        cfg[args.key] = int(args.value) if args.value == int(args.value) else args.value
+        HOME.mkdir(parents=True, exist_ok=True)
+        (HOME / "config.json").write_text(json.dumps(cfg, indent=1) + "\n")
+    print(json.dumps({k: cfg[k] for k in ([args.key] if args.key else cfg)}, indent=1))
+    return 0
 
 
 def cmd_stop(args) -> int:
     r = colab("stop", "-s", args.session, check=False)
     print((r.stdout + r.stderr).strip())
     _kill_watchdog(args.session)
+    warm_file(args.session).unlink(missing_ok=True)
     return r.returncode
 
 
@@ -554,8 +688,16 @@ def cmd_selftest(_args) -> int:
         raise AssertionError("bad brand name accepted")
     except FluxxError:
         pass
+    ns = argparse.Namespace(scenes=["16:9 | wide hero", "plain"], from_file=None, ref=[], no_refs=False, n=2,
+                            aspect=None, draft=False, seed=None)
+    shots, _ = plan_shots(ns, {"aspect": "4:5", "seed": 7})
+    assert [s["aspect"] for s in shots] == ["16:9", "16:9", "4:5", "4:5"] and shots[0]["scene"] == "wide hero"
+    assert [s["seed"] for s in shots[:2]] == [7, 8] and shots[0]["width"] > shots[0]["height"]
+    shots, ups = plan_shots(argparse.Namespace(scenes=["x"], from_file=None, ref=[__file__], no_refs=False, n=1,
+                                               aspect=None, draft=True, seed=None), {})
+    assert shots[0]["refs"] == ["refs/0"] and ups[0]["remote"] == "refs/0" and shots[0]["width"] == 1024
     compile((HERE / "remote_job.py").read_text(), "remote_job.py", "exec")
-    for code in (LAUNCH, POLL):
+    for code in (LAUNCH, "JOB = ''\n" + POLL, HEARTBEAT):
         compile(f"BEGIN=END=''\nimport json\n{code}", "remote", "exec")
     print("selftest ok")
     return 0
@@ -595,8 +737,17 @@ def main() -> int:
     p.add_argument("--gpu", default=os.environ.get("FLUXX_GPU", "A100"))
     p.add_argument("--high-mem", action=argparse.BooleanOptionalAction, default=True,
                    help="on A100 this is the 80 GB card (default); the model plus upsampler need ~40 GB")
-    p.add_argument("--max-minutes", type=float, default=60)
+    p.add_argument("--max-minutes", type=float, default=60, help="hard cap for this run (watchdog)")
+    p.add_argument("--keep", type=float, help="minutes to keep the GPU warm afterwards for a follow-up run "
+                                            "(default: config keep_minutes, 5; 0 = stop at once)")
+    p.add_argument("--candidates", type=int, help="renders per shot; the judge keeps the best "
+                                                  "(default: config candidates, 3; 1 with --draft)")
     p.set_defaults(fn=cmd_gen)
+
+    p = sub.add_parser("config", help="show or set defaults: keep_minutes, candidates")
+    p.add_argument("key", nargs="?", choices=tuple(CONFIG_DEFAULTS))
+    p.add_argument("value", nargs="?", type=float)
+    p.set_defaults(fn=cmd_config)
 
     p = sub.add_parser("rate", help="good/bad feedback on a shot")
     p.add_argument("shot", help="shot id or picture path")
@@ -614,6 +765,8 @@ def main() -> int:
         ap.error("brand NAME is required")
     if args.cmd == "gen" and not 1 <= args.n <= 16:
         ap.error("-n must be 1..16")
+    if args.cmd == "gen" and args.candidates is not None and not 1 <= args.candidates <= 8:
+        ap.error("--candidates must be 1..8")
     try:
         return args.fn(args)
     except FluxxError as e:
