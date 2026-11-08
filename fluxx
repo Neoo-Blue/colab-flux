@@ -525,10 +525,120 @@ def plan_shots(args, brand: dict) -> tuple[list[dict], list[dict]]:
         scene = m.group(2) if m else scene
         w, h = size_for(aspect, DRAFT_MP if args.draft else HD_MP)
         for k in range(args.n):
-            shots.append({"id": f"{i + 1:02d}-{slug(scene)}-v{k + 1}", "scene": scene,
-                          "request": compose(scene, brand, refs), "seed": seed + k, "width": w, "height": h,
-                          "draft": args.draft, "refs": [remote[r["path"]] for r in refs], "aspect": aspect})
+            role = (getattr(args, "roles", None) or {}).get(i)
+            studio = role in STUDIO_ROLES
+            look = {"business": brand.get("business"), "avoid": brand.get("avoid")} if studio else brand
+            shots.append({"id": f"{i + 1:02d}-{role or slug(scene)}-v{k + 1}" if role else f"{i + 1:02d}-{slug(scene)}-v{k + 1}",
+                          "scene": scene, "request": compose(scene, look, refs), "seed": seed + k, "width": w,
+                          "height": h, "draft": args.draft, "refs": [remote[r["path"]] for r in refs],
+                          "aspect": aspect, "role": role, "white": role == "main",
+                          "ref_main": bool(role) and role != "main" and "main" in (args.roles or {}).values()})
     return shots, [{"local": p, "remote": rp} for p, rp in remote.items()]
+
+
+# Listing mode: one picture per role, all square 4 MP, exported per marketplace on the GPU.
+STUDIO_ROLES = ("main", "angle", "detail")  # plain studio shots: the brand's look is not applied
+LISTING_SHOTS = [
+    ("main", "{p} alone, centered, on a pure seamless white background, straight-on product photo at eye level, "
+             "soft even studio lighting, sharp focus on the whole product, no props, no text, no shadows beyond a soft "
+             "contact shadow"),
+    ("angle", "{p} at a three-quarter angle on a pure seamless white background, soft studio lighting, no props, no text"),
+    ("detail", "close-up of {p} showing its materials, texture and finest details, studio macro photograph, "
+               "shallow depth of field, clean neutral background"),
+    ("lifestyle", "{p} in a real setting where it is used, styled for its buyers, natural and inviting"),
+    ("scale", "{p} on a table next to familiar everyday objects that make its real size obvious, natural light"),
+    ("gift", "{p} presented as a gift or in a person's hands, warm and personal, face of the person not shown"),
+]
+COPY_LIMITS = {  # field -> (max, unit); checked locally whatever the model wrote
+    "amazon": {"title": (75, "chars"), "item_highlights": (125, "chars"), "bullets": (200, "chars each"),
+               "description": (2000, "chars"), "search_terms": (250, "bytes")},
+    "etsy": {"title": (140, "chars"), "tags": (20, "chars each"), "description": (5000, "chars")},
+    "ebay": {"title": (80, "chars"), "description": (4000, "chars")},
+    "shopify": {"title": (70, "chars"), "seo_title": (60, "chars"), "seo_description": (160, "chars")},
+}
+TAG_COUNT = {"etsy": 13, "shopify": 10}
+
+
+def clip(text: str, limit: int, unit: str = "chars") -> str:
+    """Cut at the last word boundary within the limit (bytes in UTF-8 for Amazon search terms)."""
+    text = " ".join(str(text).split())
+    size = (lambda t: len(t.encode())) if unit == "bytes" else len
+    if size(text) <= limit:
+        return text
+    words, out = text.split(" "), ""
+    for w in words:
+        cand = f"{out} {w}".strip()
+        if size(cand) > limit:
+            break
+        out = cand
+    return out.rstrip(" ,;:-")
+
+
+def check_copy(market: str, copy: dict) -> tuple[dict, list[str]]:
+    """Enforce each marketplace's limits; returns the fixed copy and what was changed."""
+    fixed, notes = dict(copy), []
+    for field, (limit, unit) in COPY_LIMITS.get(market, {}).items():
+        val = fixed.get(field)
+        if isinstance(val, list):
+            keep = []
+            for v in val:
+                c = clip(v, limit, "chars")
+                if not c or (field == "tags" and len(str(v).strip()) > limit):
+                    notes.append(f"{field}: dropped '{v}' (over {limit} {unit})")
+                    continue
+                if c != " ".join(str(v).split()):
+                    notes.append(f"{field}: shortened one to {limit} {unit}")
+                keep.append(c)
+            if field == "tags":
+                keep = list(dict.fromkeys(t.lower() for t in keep))[:TAG_COUNT.get(market, len(keep))]
+                if len(keep) < TAG_COUNT.get(market, 0):
+                    notes.append(f"tags: {len(keep)} of {TAG_COUNT[market]}; add more by hand")
+            fixed[field] = keep
+        elif isinstance(val, str):
+            c = clip(val, limit, unit.split()[0])
+            if c != " ".join(val.split()):
+                notes.append(f"{field}: shortened to {limit} {unit.split()[0]}")
+            fixed[field] = c
+    if market == "amazon" and len(fixed.get("bullets", [])) != 5:
+        notes.append(f"bullets: {len(fixed.get('bullets', []))} instead of 5")
+    return fixed, notes
+
+
+def copy_markdown(market: str, copy: dict, notes: list[str]) -> str:
+    lines = [f"# {market.capitalize()} listing (draft, check every fact before publishing)", ""]
+    for k, v in copy.items():
+        if k in ("error", "raw"):
+            continue
+        n = f" ({len(v.encode()) if k == 'search_terms' else len(v)} {'bytes' if k == 'search_terms' else 'chars'})" \
+            if isinstance(v, str) else ""
+        lines.append(f"## {k.replace('_', ' ')}{n}")
+        if isinstance(v, list):
+            lines += [f"- {x}" for x in v]
+        elif isinstance(v, dict):
+            lines += [f"- **{a}**: {b}" for a, b in v.items()]
+        else:
+            lines.append(str(v))
+        lines.append("")
+    if notes:
+        lines += ["## fixed by fluxx", *[f"- {n}" for n in notes], ""]
+    if copy.get("error"):
+        lines += ["## the model's reply could not be read", "```", copy.get("raw", ""), "```"]
+    return "\n".join(lines)
+
+
+def cmd_listing(args) -> int:
+    markets = [m.strip().lower() for m in args.markets.split(",") if m.strip()]
+    bad = [m for m in markets if m not in COPY_LIMITS]
+    if bad:
+        raise FluxxError(f"unknown marketplace {bad}; choose from {', '.join(COPY_LIMITS)}")
+    roles = [r for r, _ in LISTING_SHOTS if not args.only or r in args.only.split(",")]
+    args.scenes = [f"1:1 | {dict(LISTING_SHOTS)[r].format(p=args.product)}" for r in roles]
+    args.roles = dict(enumerate(roles))
+    args.from_file, args.n, args.aspect = None, 1, None
+    brand = load_brand(args.brand)
+    args.listing = {"markets": markets, "product": args.product, "notes": args.notes or "",
+                    "business": brand.get("business", "")}
+    return cmd_gen(args)
 
 
 def cmd_gen(args) -> int:
@@ -544,6 +654,8 @@ def cmd_gen(args) -> int:
     mode = {"model": MODEL, "source": source, "upsample": not args.no_upsample, "judge": True}
     spec = {"md_side": MD_SIDE, "candidates": args.candidates, "avoid": brand.get("avoid", ""),
             "checks": brand.get("checks", []), "shots": shots}
+    if getattr(args, "listing", None):
+        spec["listing"] = args.listing
     sizes = sorted({f"{s['width']}x{s['height']}" for s in shots})
     log(f"{len(shots)} shot(s) at {', '.join(sizes)}, up to {args.candidates} candidate(s) each, judged; "
         f"{len(uploads)} reference(s) -> {out}")
@@ -581,7 +693,7 @@ def cmd_gen(args) -> int:
                 if misses >= 8:
                     raise
                 continue
-            line = st["stage"] + (f" {st['done'] + (st['stage'] != 'finished')}/{st['total']}" if "total" in st else "") \
+            line = st["stage"] + (f" {st['done'] + (st['stage'] == 'rendering')}/{st['total']}" if "total" in st else "") \
                 + (f" candidate {st['candidate']}/{st['of']}" if st.get("of", 1) > 1 else "")
             if line != last:
                 log(line)
@@ -609,6 +721,10 @@ def cmd_gen(args) -> int:
     now, recs, failed = time.strftime("%Y-%m-%dT%H:%M:%S"), [], 0
     by_id = {s["id"]: s for s in shots}
     for r in manifest["shots"]:
+        if r["id"] not in by_id:  # e.g. the listing step's own error row
+            log(f"{r['id']}: FAILED {r.get('error', '')[:300]}")
+            failed += 1
+            continue
         rec = {"id": r["id"], "time": now, "scene": r["scene"], "caption": r.get("caption", ""), "seed": r.get("seed"),
                "aspect": by_id[r["id"]]["aspect"], "size": f"{r['width']}x{r['height']}",
                "score": r.get("score"), "defects": r.get("defects", []),
@@ -627,6 +743,13 @@ def cmd_gen(args) -> int:
             judged = f"score {rec['score']}/10" if rec["score"] is not None else "not judged"
             log(f"{r['id']}: {judged}, best of {tried}" + (f"; defects: {'; '.join(rec['defects'])}" if rec["defects"] else ""))
     append_history(args.brand, recs)
+    for cj in sorted((out / "markets").glob("*/copy.json")):
+        market = cj.parent.name
+        fixed, notes = check_copy(market, json.loads(cj.read_text()))
+        cj.write_text(json.dumps(fixed, indent=1) + "\n")
+        (cj.parent / "listing.md").write_text(copy_markdown(market, fixed, notes))
+        pics = len(list(cj.parent.glob("*.jpg")))
+        log(f"{market}: {pics} pictures + listing.md -> {cj.parent}" + (f" ({len(notes)} fix(es))" if notes else ""))
     log(f"{len(recs) - failed}/{len(recs)} pictures in {manifest.get('job_s', '?')}s on {manifest.get('gpu', '?')}"
         + (f", model ready after {info['ready_s']}s" if not info["warm"] and info.get("ready_s") else "")
         + (f" ({info['note']})" if info.get("note") else "") + f" -> {out}")
@@ -696,6 +819,17 @@ def cmd_selftest(_args) -> int:
     shots, ups = plan_shots(argparse.Namespace(scenes=["x"], from_file=None, ref=[__file__], no_refs=False, n=1,
                                                aspect=None, draft=True, seed=None), {})
     assert shots[0]["refs"] == ["refs/0"] and ups[0]["remote"] == "refs/0" and shots[0]["width"] == 1024
+    assert clip("Red Rotary Telephone Vintage Style Corded Desk Phone", 20) == "Red Rotary Telephone"
+    assert clip("a b c", 3, "bytes") == "a b" and len(clip("é" * 200, 250, "bytes").encode()) <= 250
+    fixed, notes = check_copy("etsy", {"title": "x" * 150, "tags": ["ok tag", "a tag that is far too long", "OK TAG"]})
+    assert len(fixed["title"]) <= 140 and fixed["tags"] == ["ok tag"] and any("dropped" in n for n in notes)
+    fixed, notes = check_copy("amazon", {"title": "word " * 30, "bullets": ["b"] * 4, "search_terms": "w " * 200})
+    assert len(fixed["title"]) <= 75 and len(fixed["search_terms"].encode()) <= 250 and any("bullets" in n for n in notes)
+    ns = argparse.Namespace(scenes=["1:1 | main", "1:1 | life"], roles={0: "main", 1: "lifestyle"}, from_file=None,
+                            ref=[], no_refs=False, n=1, aspect=None, draft=False, seed=None)
+    shots, _ = plan_shots(ns, {"style": "moody", "business": "b"})
+    assert shots[0]["white"] and "moody" not in shots[0]["request"] and "moody" in shots[1]["request"]
+    assert shots[0]["id"] == "01-main-v1" and not shots[0]["ref_main"] and shots[1]["ref_main"]
     compile((HERE / "remote_job.py").read_text(), "remote_job.py", "exec")
     for code in (LAUNCH, "JOB = ''\n" + POLL, HEARTBEAT):
         compile(f"BEGIN=END=''\nimport json\n{code}", "remote", "exec")
@@ -744,6 +878,23 @@ def main() -> int:
                                                   "(default: config candidates, 3; 1 with --draft)")
     p.set_defaults(fn=cmd_gen)
 
+    p = sub.add_parser("listing", help="marketplace listing pack: pictures per site + drafted copy")
+    p.add_argument("-b", "--brand", required=True)
+    p.add_argument("--product", required=True, help="what it is, e.g. 'hand-poured soy candle in an amber jar'")
+    p.add_argument("--for", dest="markets", default="amazon,etsy,ebay,shopify", help="comma list (default all four)")
+    p.add_argument("--notes", help="facts for the copy: size, materials, what is included, care")
+    p.add_argument("--only", help="comma list of roles: main,angle,detail,lifestyle,scale,gift")
+    p.add_argument("--ref", action="append", default=[], help="product photo for this listing")
+    p.add_argument("--no-refs", action="store_true", help="ignore the brand's references (another product)")
+    for a, kw in (("--draft", {"action": "store_true"}), ("--seed", {"type": int}), ("--out", {}),
+                  ("--no-upsample", {"action": "store_true"}), ("-s", {"dest": "session", "default": "flux-gpu"}),
+                  ("--gpu", {"default": os.environ.get("FLUXX_GPU", "A100")}),
+                  ("--high-mem", {"action": argparse.BooleanOptionalAction, "default": True}),
+                  ("--max-minutes", {"type": float, "default": 60}), ("--keep", {"type": float}),
+                  ("--candidates", {"type": int})):
+        p.add_argument(a, **kw)
+    p.set_defaults(fn=cmd_listing)
+
     p = sub.add_parser("config", help="show or set defaults: keep_minutes, candidates")
     p.add_argument("key", nargs="?", choices=tuple(CONFIG_DEFAULTS))
     p.add_argument("value", nargs="?", type=float)
@@ -765,7 +916,7 @@ def main() -> int:
         ap.error("brand NAME is required")
     if args.cmd == "gen" and not 1 <= args.n <= 16:
         ap.error("-n must be 1..16")
-    if args.cmd == "gen" and args.candidates is not None and not 1 <= args.candidates <= 8:
+    if args.cmd in ("gen", "listing") and args.candidates is not None and not 1 <= args.candidates <= 8:
         ap.error("--candidates must be 1..8")
     try:
         return args.fn(args)

@@ -9,6 +9,10 @@ Colab compute units.
 - **Consistent**: your real product photos go in as reference images, and every shot follows
   your brand's style and seed
 - **Learns your taste**: tell the agent what you like and dislike, and it refines your brand profile
+- **Marketplace listing packs**: `fluxx listing` makes the standard six shots (pure-white main image at
+  RGB 255 with the product filling 85% of the frame, angle, detail, lifestyle, scale, gift), exports them
+  per site (Amazon, Etsy, eBay, Shopify: order, names, sizes) and drafts each site's title, bullets and
+  tags within its limits (Amazon's 75-character title, Etsy's 13 tags of 20 characters, eBay's 80)
 - **Two sizes per shot**: high definition PNG (about 4 MP, e.g. 2048x2048) and a medium JPEG
   (1024 px) for listings and social
 - **Best of several, judged**: each shot is rendered up to 3 times and a vision model on the same GPU

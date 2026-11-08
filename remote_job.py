@@ -130,6 +130,116 @@ def judge_image(judge, img, refs, scene, avoid, checks=()):
         return None, [f"judge reply unreadable: {raw[:120]}"]
 
 
+def whiten(img, canvas=2048, fill=0.85, tol=236):
+    """Marketplace main image: background near-white pixels connected to the border become pure RGB 255, then
+    the product is cropped and centered so its longest side fills `fill` of a square white canvas."""
+    from PIL import Image, ImageChops, ImageDraw
+    im = img.convert("RGB")
+    r, g, b = im.split()
+    mask = ImageChops.darker(ImageChops.darker(r, g), b).point(lambda v: 255 if v >= tol else 0)
+    w, h = mask.size
+    step = max(1, min(w, h) // 64)
+    for x in list(range(0, w, step)) + [w - 1]:
+        for y in (0, h - 1):
+            if mask.getpixel((x, y)) == 255:
+                ImageDraw.floodfill(mask, (x, y), 128)
+    for y in list(range(0, h, step)) + [h - 1]:
+        for x in (0, w - 1):
+            if mask.getpixel((x, y)) == 255:
+                ImageDraw.floodfill(mask, (x, y), 128)
+    fg = mask.point(lambda v: 0 if v == 128 else 255)
+    im = Image.composite(im, Image.new("RGB", im.size, (255, 255, 255)), fg)
+    box = fg.getbbox()
+    if not box:
+        return im.resize((canvas, canvas))
+    prod = im.crop(box)
+    k = fill * canvas / max(prod.size)
+    prod = prod.resize((max(1, round(prod.width * k)), max(1, round(prod.height * k))), Image.LANCZOS)
+    out = Image.new("RGB", (canvas, canvas), (255, 255, 255))
+    out.paste(prod, ((canvas - prod.width) // 2, (canvas - prod.height) // 2))
+    return out
+
+
+# Per marketplace: picture order, file names, square size. Amazon/eBay/Shopify lead with the white main image;
+# Etsy's first photo is its search thumbnail, where a styled shot does better.
+MARKETS = {
+    "amazon": {"order": ["main", "angle", "detail", "lifestyle", "scale", "gift"], "side": 2048,
+               "name": lambda i: "MAIN" if i == 0 else f"PT{i:02d}"},
+    "etsy": {"order": ["lifestyle", "main", "angle", "detail", "scale", "gift"], "side": 2048, "name": lambda i: f"{i + 1:02d}"},
+    "ebay": {"order": ["main", "angle", "detail", "lifestyle", "scale", "gift"], "side": 1600, "name": lambda i: f"{i + 1:02d}"},
+    "shopify": {"order": ["main", "angle", "detail", "lifestyle", "scale", "gift"], "side": 2048, "name": lambda i: f"{i + 1:02d}"},
+}
+COPY_RULES = {
+    "amazon": ("title: at most 75 characters including spaces: brand, product type, one key attribute. No promotional "
+               "words (best, sale, free shipping), no ALL CAPS, no ! $ ? or emoji. item_highlights: at most 125 characters. "
+               "bullets: exactly 5, each at most 200 characters, each starting with a short benefit in capitals followed "
+               "by a colon. description: at most 2000 characters. search_terms: at most 240 characters, lowercase words "
+               "separated by spaces, no commas, no brand names, no words already in the title.",
+               '{"title": "", "item_highlights": "", "bullets": ["", "", "", "", ""], "description": "", "search_terms": ""}'),
+    "etsy": ("title: at most 140 characters, the words a buyer would search first (the first 40 characters matter most), "
+             "plain and readable, no keyword stuffing. tags: exactly 13, each at most 20 characters including spaces, "
+             "multi-word search phrases, no repeats. description: its first 160 characters say what it is and who it is "
+             "for; at most 1500 characters.",
+             '{"title": "", "tags": ["", "", "", "", "", "", "", "", "", "", "", "", ""], "description": ""}'),
+    "ebay": ("title: at most 80 characters: brand, product type, model, color, key spec; no special characters, no "
+             "words like wow or look. item_specifics: name/value pairs only for facts the seller gave or that are "
+             "plainly visible (Type, Color, Style...); leave out any key you would have to guess "
+             "(Brand, Material, Condition, size). description: at most 1500 characters.",
+             '{"title": "", "item_specifics": {"Type": ""}, "description": ""}'),
+    "shopify": ("title: at most 70 characters. seo_title: at most 60 characters. seo_description: at most 160 "
+                "characters. description: at most 1500 characters, short paragraphs. tags: up to 10 short tags.",
+                '{"title": "", "seo_title": "", "seo_description": "", "description": "", "tags": [""]}'),
+}
+COPY_PROMPT = """You write {market} listing copy for a product. The image shows the product.
+Product: {product}
+Seller: {business}
+Facts from the seller: {notes}
+State as fact only what the seller gave or what is plainly visible in the image. Never invent sizes, materials,
+quantities, certifications, ratings or shipping promises. Write for buyers, in plain natural English.
+Rules for {market}: {rules}
+Reply with JSON only, exactly this shape: {schema}"""
+
+
+def write_copy(judge, img, listing, market):
+    import torch
+    model, proc = judge
+    rules, schema = COPY_RULES[market]
+    text = COPY_PROMPT.format(market=market.capitalize(), product=listing["product"], business=listing["business"],
+                              notes=listing.get("notes") or "none given", rules=rules, schema=schema)
+    content = [{"type": "image", "image": small(img)}, {"type": "text", "text": text}]
+    inputs = proc.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True,
+                                      tokenize=True, return_dict=True, return_tensors="pt",
+                                      enable_thinking=False).to(model.device)
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=2000, do_sample=False)
+    raw = proc.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    i, j = raw.find("{"), raw.rfind("}")
+    try:
+        return json.loads(raw[i:j + 1])
+    except ValueError:
+        return {"error": "unreadable reply", "raw": raw[:3000]}
+
+
+def export_listing(out, results, listing, judge):
+    """markets/<market>/ with the pictures in that market's order, names and size, plus <market>.json copy."""
+    from PIL import Image
+    by_role = {r["role"]: r for r in results if r.get("role") and r.get("hd")}
+    for market in listing["markets"]:
+        m = MARKETS[market]
+        os.makedirs(f"{out}/markets/{market}", exist_ok=True)
+        n = 0
+        for role in m["order"]:
+            if role in by_role:
+                im = Image.open(f"{out}/{by_role[role]['hd']}").convert("RGB")
+                if im.size != (m["side"], m["side"]):
+                    im = im.resize((m["side"], m["side"]), Image.LANCZOS)
+                im.save(f"{out}/markets/{market}/{m['name'](n)}.jpg", quality=95, subsampling=0)
+                n += 1
+        if judge and "main" in by_role:
+            main = Image.open(f"{out}/{by_role['main']['hd']}")
+            json.dump(write_copy(judge, main, listing, market), open(f"{out}/markets/{market}/copy.json", "w"), indent=1)
+
+
 def run_job(pipe, judge, jd):
     import torch
     from PIL import Image
@@ -138,11 +248,15 @@ def run_job(pipe, judge, jd):
     os.makedirs(f"{out}/alts", exist_ok=True)
     refs = {p: Image.open(f"{jd}/{p}").convert("RGB") for s in spec["shots"] for p in s["refs"]}
     results, total, t_job = [], len(spec["shots"]), time.time()
+    main_img = None  # listing mode: the finished white main image becomes the clean reference for later shots
     for i, shot in enumerate(spec["shots"]):
         rec = {k: shot[k] for k in ("id", "scene", "width", "height")}
+        rec["role"] = shot.get("role")
         t = time.time()
         try:
             shot_refs = [refs[p] for p in shot["refs"]]
+            if shot.get("ref_main") and main_img is not None:
+                shot_refs = [main_img]
             cands = []
             for c in range(spec["candidates"]):
                 progress(jd, stage="rendering", done=i, total=total, candidate=c + 1, of=spec["candidates"])
@@ -161,6 +275,10 @@ def run_job(pipe, judge, jd):
                     break
             best = max(cands, key=lambda x: (x["score"] if x["score"] is not None else -1, -len(x["defects"])))
             img = best["img"]
+            if shot.get("white"):
+                img = whiten(img, canvas=max(shot["width"], shot["height"]))
+            if shot.get("role") == "main":
+                main_img = img
             if not shot["draft"]:
                 img.save(f"{out}/{shot['id']}_hd.png")
                 rec["hd"] = f"{shot['id']}_hd.png"
@@ -180,6 +298,12 @@ def run_job(pipe, judge, jd):
         results.append(rec)
         torch.cuda.empty_cache()
 
+    if spec.get("listing"):
+        progress(jd, stage="writing listings", done=total, total=total)
+        try:
+            export_listing(out, results, spec["listing"], judge)
+        except Exception as e:
+            results.append({"id": "listing", "error": f"{type(e).__name__}: {e}"[:800]})
     gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.total", "--format=csv,noheader"],
                          capture_output=True, text=True).stdout.strip()
     json.dump({"gpu": gpu, "job_s": round(time.time() - t_job), "shots": results},

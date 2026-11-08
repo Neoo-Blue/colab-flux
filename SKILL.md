@@ -1,6 +1,6 @@
 ---
 name: colab-flux
-description: Consistent product and brand pictures with FLUX 3 Image Klein (Black Forest Labs, open weights) on a Google Colab GPU that is started for the job and stopped right after, via the fluxx CLI. Use when someone wants product shots, catalog or listing images, lifestyle scenes, social posts or ad visuals that look like the same brand every time - the same product, the same light, the same feel - without paying per image to an image API. Each business gets a brand profile (what they sell, their look, what to avoid, reference photos of the product) that learns from their good/bad feedback. Renders several candidates per shot and an on-GPU judge keeps the best; outputs a high-definition PNG (~4 MP) and a medium JPEG (1024 px) per shot; keeps the GPU warm a few minutes for follow-ups. Also covers first-time setup (Google sign-in for Colab, Hugging Face license and token), changing a brand's style, and the fluxx commands. Invocable as /colab-flux.
+description: Consistent product, brand and marketplace-listing pictures with FLUX 3 Image Klein (Black Forest Labs, open weights) on a Google Colab GPU that is started for the job and stopped right after, via the fluxx CLI. Use when someone wants product shots, catalog or listing images, lifestyle scenes, social posts or ad visuals that look like the same brand every time - the same product, the same light, the same feel - without paying per image to an image API. Also makes marketplace listing packs for Amazon, Etsy, eBay and Shopify: a pure-white main image to Amazon's rules, the standard shot set per site, and drafted titles, bullets and tags within each site's limits. Each business gets a brand profile (what they sell, their look, what to avoid, reference photos of the product) that learns from their good/bad feedback. Renders several candidates per shot and an on-GPU judge keeps the best; outputs a high-definition PNG (~4 MP) and a medium JPEG (1024 px) per shot; keeps the GPU warm a few minutes for follow-ups. Also covers first-time setup (Google sign-in for Colab, Hugging Face license and token), changing a brand's style, and the fluxx commands. Invocable as /colab-flux.
 ---
 
 # colab-flux
@@ -114,7 +114,49 @@ faster, for exploring a new direction · `--aspect W:H` · `--ref PATH` one-off 
 Outputs per shot: `<id>_hd.png` (about 4 MP, e.g. 2048x2048, for print, zoom and hero images) and
 `<id>_md.jpg` (1024 px long side, for listings, web and social).
 
-## 4. Learning what they like
+## 4. Marketplace listings (Amazon, Etsy, eBay, Shopify)
+
+When the pictures are for selling a product online, use `fluxx listing` instead of `gen`. One run makes
+the standard set of six square 4 MP shots, exports a folder per marketplace with that site's order,
+names and sizes, and drafts the listing copy on the GPU (the judge model writes it, so no Claude tokens):
+
+```bash
+fluxx listing -b acme-candles --product "hand-poured soy candle in an amber glass jar with a wooden lid" \
+  --notes "8 oz, 50-hour burn, cotton wick, scent: cedar and smoke, made in Oregon" --for amazon,etsy
+```
+
+| Shot (role) | What | Brand look |
+|---|---|---|
+| `main` | product alone on pure white, centered | none: fluxx then makes the background exactly RGB 255 and scales the product to fill 85% of the frame (Amazon's main-image rule) |
+| `angle` | three-quarter view on white | none |
+| `detail` | close-up of materials and finish | none |
+| `lifestyle` | in use, in a setting that fits the buyers | yes |
+| `scale` | next to everyday objects, so the size is obvious | yes |
+| `gift` | in hands or as a gift, no face | yes |
+
+Output in the run folder under `markets/<site>/`:
+
+| Site | Pictures | Copy (`listing.md` + `copy.json`), limits enforced by fluxx |
+|---|---|---|
+| amazon | `MAIN.jpg`, `PT01.jpg`... 2048 px | title 75 chars (the limit since July 2026), item highlights 125, 5 bullets of 200, description 2000, search terms 250 bytes |
+| etsy | `01.jpg`... 2048 px, a styled shot first (it is the search thumbnail) | title 140, 13 tags of 20 chars, description |
+| ebay | `01.jpg`... 1600 px | title 80, item specifics, description |
+| shopify | `01.jpg`... 2048 px | title 70, SEO title 60, SEO description 160, description, tags |
+
+Rules for the agent:
+- **Facts come from the seller.** Ask for size, materials, what is included and care before the run, and
+  pass them in `--notes`. The copy model is told never to invent facts, but read `listing.md` and remove
+  any claim that is not in the notes or visible in the picture before the person publishes.
+- **The pictures show what FLUX drew, not the real item.** For `main`, `angle` and `detail`, the product
+  must match the person's real product: check it against their photos, and tell them that marketplaces
+  require images to show the actual item. Lifestyle shots are where generated scenes help most.
+- The finished white `main` image becomes the product reference for the later shots, so props in the
+  person's own photo (a tablecloth, decorations) do not leak into lifestyle shots. Still ask for a plain,
+  well-lit product photo: it is what `main` is drawn from.
+- `--only main,lifestyle` makes a subset; `--no-refs --ref other.jpg` lists a different product of the
+  same brand; `--for etsy` limits the sites.
+
+## 5. Learning what they like
 
 The profile gets better only if you close the loop. Every time the person reacts to a picture:
 
@@ -162,6 +204,7 @@ fluxx doctor                       # what is set up, what is missing
 fluxx login                        # Google sign-in + Hugging Face token (person runs it, needs a terminal)
 fluxx brand new|show|list|ref ...  # brand profiles
 fluxx gen -b NAME [...] scenes...  # render (reuses a warm GPU)
+fluxx listing -b NAME --product .. --notes .. [--for amazon,etsy,ebay,shopify]  # marketplace pack
 fluxx rate SHOT good|bad "why"     # feedback
 fluxx config [keep_minutes|candidates N]   # defaults: 5 warm minutes, 3 candidates
 fluxx status                       # Colab sessions and compute-unit balance
