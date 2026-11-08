@@ -42,5 +42,5 @@ echo "colab-flux installed at $DIR"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "note: add ~/.local/bin to your PATH" ;; esac
 fluxx selftest
 fluxx doctor || echo "
-Next: run 'fluxx login' in a terminal (Google sign-in for Colab, then the Hugging Face token),
+Next: run 'fluxx login' in a terminal (Google sign-in for Colab; the Hugging Face token is optional),
 then ask your agent for product pictures. It will set up your brand with a few questions."
