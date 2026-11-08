@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""fluxx: consistent product and brand pictures with FLUX 3 Image Klein on a Google Colab GPU.
+
+Every `gen` is one GPU lifetime: colab new -> install diffusers -> load FLUX 3 Klein -> render every
+shot -> download the pictures -> colab stop. The GPU never outlives the command (try/finally,
+SIGTERM/SIGHUP handlers, and a detached watchdog that stops it after --max-minutes).
+
+  fluxx login                      sign in to Google (Colab) and save a Hugging Face token, once
+  fluxx doctor                     what is set up and what is still missing
+  fluxx brand new NAME [--business .. --style .. --avoid .. --aspect 4:5]
+  fluxx brand ref NAME IMAGE [--role product|style]    add a reference picture
+  fluxx brand show NAME | list
+  fluxx gen -b NAME [-n 2] [--aspect 1:1] [--draft] "scene" ["scene" ...]   (or --from FILE)
+  fluxx rate SHOT good|bad ["why"]  feedback the brand learns from
+  fluxx stop | status | selftest
+
+Pictures land in ~/colab-flux/brands/NAME/shots/<time>/ as <id>_hd.png (about 4 MP) and
+<id>_md.jpg (1024 px long side). Progress and the cost line go to stderr.
+"""
+from __future__ import annotations
+
+import sys
+
+if sys.platform == "win32":
+    sys.exit("fluxx: native Windows is not supported (the Colab CLI is macOS/Linux only). Run it inside WSL2.")
+
+import argparse
+import contextlib
+import fcntl
+import getpass
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from pathlib import Path
+
+MODEL = os.environ.get("FLUXX_MODEL", "black-forest-labs/flux-3-image-klein")
+HOME = Path(os.environ.get("COLAB_FLUX_HOME", Path.home() / "colab-flux"))
+STATE = Path.home() / ".cache" / "colab-flux"
+HF_TOKEN_FILE = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "token"
+COLAB_TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"
+HERE = Path(__file__).resolve().parent
+REMOTE = "/content/fluxx"
+BEGIN, END = "<<<FLUXX_BEGIN>>>", "<<<FLUXX_END>>>"
+MAX_REFS = 10
+HD_MP, DRAFT_MP, MD_SIDE = 4.0, 1.0, 1024
+ROLES = {
+    "product": "the product: keep it exactly as shown, same shape, label, text, colors and proportions",
+    "style": "a style reference: match its lighting, palette, framing and mood, not its contents",
+}
+
+
+class FluxxError(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    print(f"[fluxx] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- brands and learning
+
+def brand_dir(name: str) -> Path:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", name):
+        raise FluxxError(f"brand name '{name}': use lowercase letters, digits and dashes")
+    return HOME / "brands" / name
+
+
+def load_brand(name: str) -> dict:
+    p = brand_dir(name) / "brand.json"
+    if not p.exists():
+        raise FluxxError(f"no brand '{name}'. Create it: fluxx brand new {name} --business '...' --style '...'")
+    return json.loads(p.read_text())
+
+
+def save_brand(name: str, b: dict) -> None:
+    (brand_dir(name) / "brand.json").write_text(json.dumps(b, indent=1) + "\n")
+
+
+def history(name: str) -> list[dict]:
+    p = brand_dir(name) / "history.jsonl"
+    return [json.loads(line) for line in p.read_text().splitlines() if line.strip()] if p.exists() else []
+
+
+def append_history(name: str, recs: list[dict]) -> None:
+    with open(brand_dir(name) / "history.jsonl", "a") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+
+
+def compose(scene: str, brand: dict, refs: list[dict]) -> str:
+    """The request handed to FLUX 3's prompt upsampler (or used as the caption with --no-upsample)."""
+    parts = [scene.strip().rstrip(".") + "."]
+    if brand.get("business"):
+        parts.append(f"It is for {brand['business']}.")
+    if brand.get("style"):
+        parts.append(f"Visual style: {brand['style']}.")
+    if brand.get("avoid"):
+        parts.append(f"Leave out: {brand['avoid']}.")
+    if refs:
+        parts.append("Reference images: " + "; ".join(
+            f"image {i + 1} is {ROLES[r['role']]}" for i, r in enumerate(refs)) + ".")
+    return " ".join(parts)
+
+
+def size_for(aspect: str, mp: float) -> tuple[int, int]:
+    """Width and height near `mp` megapixels at `aspect` (w:h), multiples of 32 as FLUX 3 needs."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)[:x/](\d+(?:\.\d+)?)", aspect)
+    if not m:
+        raise FluxxError(f"aspect '{aspect}': use W:H, e.g. 1:1, 4:5, 3:2, 16:9, 9:16")
+    a = float(m.group(1)) / float(m.group(2))
+    if not 0.25 <= a <= 4:
+        raise FluxxError(f"aspect '{aspect}' is too extreme (1:4 to 4:1)")
+    h = math.sqrt(mp * 1024 * 1024 / a)
+    return max(256, round(a * h / 32) * 32), max(256, round(h / 32) * 32)
+
+
+def slug(text: str, n: int = 32) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:n].strip("-") or "shot"
+
+
+# ---------------------------------------------------------------- Colab plumbing
+
+_ENV: dict | None = None
+
+
+def colab_env() -> dict:
+    """The Colab CLI's kernel websocket uses Python's default CA store, which is empty on python.org and
+    uv-managed builds (CERTIFICATE_VERIFY_FAILED). Point it at the certifi bundle in the CLI's own env."""
+    global _ENV
+    if _ENV is None:
+        _ENV = dict(os.environ)
+        if "SSL_CERT_FILE" not in _ENV and shutil.which("colab"):
+            try:
+                py = Path(shutil.which("colab")).resolve().read_text(errors="replace").split("\n", 1)[0]
+                ca = subprocess.run([py.removeprefix("#!").strip(), "-c", "import certifi; print(certifi.where())"],
+                                    capture_output=True, text=True, timeout=30).stdout.strip()
+                if ca and Path(ca).is_file():
+                    _ENV["SSL_CERT_FILE"] = ca
+            except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+                pass
+    return _ENV
+
+
+def colab(*args: str, code: str | None = None, timeout: float = 120, check: bool = True):
+    try:
+        r = subprocess.run(["colab", *args], input=code, text=True, capture_output=True,
+                           timeout=timeout, env=colab_env())
+    except subprocess.TimeoutExpired as e:
+        raise FluxxError(f"`colab {args[0]}` timed out after {timeout:.0f}s") from e
+    if check and r.returncode:
+        raise FluxxError(f"`colab {' '.join(args[:3])}` failed (exit {r.returncode}): "
+                         f"{(r.stderr + r.stdout).strip()[-1200:]}")
+    return r
+
+
+def payload(text: str) -> dict:
+    """`colab exec` exits 0 even when the remote code raised, so a missing marker IS the error."""
+    i = text.rfind(BEGIN)
+    j = text.find(END, i + 1) if i >= 0 else -1
+    if i < 0 or j < 0:
+        raise FluxxError("remote step produced no result (it raised on the VM):\n" + text.strip()[-2000:])
+    return json.loads(text[i + len(BEGIN):j].strip())
+
+
+def rexec(session: str, code: str, timeout: float = 90) -> dict:
+    code = f"BEGIN = {BEGIN!r}\nEND = {END!r}\nimport json\n" + code
+    r = colab("exec", "-s", session, "--timeout", str(int(timeout)), code=code, timeout=timeout + 60, check=False)
+    return payload(r.stdout + "\n" + r.stderr)
+
+
+LAUNCH = f'''
+import os, subprocess
+os.makedirs("{REMOTE}/refs", exist_ok=True)
+subprocess.Popen(["sh", "-c", "python3 {REMOTE}/remote_job.py > {REMOTE}/job.log 2>&1"], start_new_session=True)
+print(BEGIN); print("{{}}"); print(END)
+'''
+POLL = f'''
+import os
+p = "{REMOTE}/progress.json"
+st = json.load(open(p)) if os.path.exists(p) else {{"stage": "starting"}}
+if st.get("stage") == "failed":
+    st["log"] = open("{REMOTE}/job.log", errors="replace").read()[-3000:]
+print(BEGIN); print(json.dumps(st)); print(END)
+'''
+
+
+def _kill_watchdog(session: str) -> None:
+    pidfile = STATE / f"watchdog-{session}.pid"
+    try:
+        os.killpg(int(pidfile.read_text()), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    pidfile.unlink(missing_ok=True)
+
+
+def _raise_interrupt(signum, _frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+@contextlib.contextmanager
+def gpu_session(args):
+    """One GPU for the duration of the block, always stopped afterwards. Yields a dict for the CU rate."""
+    if not shutil.which("colab"):
+        raise FluxxError("Colab CLI not installed: run install.sh, or `uv tool install google-colab-cli`")
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE / f"{args.session}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise FluxxError(f"another fluxx run holds session '{args.session}'; wait, or use -s NAME")
+    _kill_watchdog(args.session)
+    colab("stop", "-s", args.session, check=False, timeout=90)
+    wd = subprocess.Popen(["sh", "-c", f"sleep {int(args.max_minutes * 60)}; colab stop -s {args.session}"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                          env=colab_env())
+    (STATE / f"watchdog-{args.session}.pid").write_text(str(wd.pid))
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_interrupt)
+    t0, info = time.time(), {}
+    try:
+        log(f"allocating {args.gpu} as session '{args.session}' (watchdog stops it at {args.max_minutes:g} min)")
+        hm = args.high_mem and args.gpu.upper() in ("A100", "T4")
+        colab("new", "-s", args.session, "--gpu", args.gpu, *(["--high-mem"] if hm else []), timeout=600)
+        log(f"VM up in {time.time() - t0:.0f}s")
+        m = re.search(r"Usage rate:\s*([\d.]+)", colab("usage", check=False, timeout=60).stdout)
+        info["rate"] = float(m.group(1)) if m else None
+        yield info
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # nothing may interrupt the stop
+        stopped = False
+        for attempt in range(3):
+            if colab("stop", "-s", args.session, check=False, timeout=120).returncode == 0:
+                stopped = True
+                break
+            time.sleep(2 ** attempt)
+        if not stopped:
+            r = colab("sessions", check=False, timeout=60)
+            stopped = r.returncode == 0 and f"[{args.session}]" not in r.stdout
+        if stopped:
+            _kill_watchdog(args.session)
+        else:
+            log(f"WARNING: could not confirm the stop; the watchdog is still armed. Run `fluxx status` now.")
+        mins = (time.time() - t0) / 60
+        rate = info.get("rate")
+        cost = f" ~{rate * mins / 60:.2f} compute units at {rate:g}/h" if rate else ""
+        log(f"session {'stopped' if stopped else 'NOT CONFIRMED STOPPED'} after {mins:.1f} min{cost}")
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        lock.close()
+
+
+# ---------------------------------------------------------------- accounts
+
+def hf_token() -> str | None:
+    tok = os.environ.get("HF_TOKEN") or (HF_TOKEN_FILE.read_text().strip() if HF_TOKEN_FILE.exists() else "")
+    return tok or None
+
+
+def hf_access(tok: str) -> str:
+    """'ok', 'license' (token fine, FLUX license not accepted yet) or 'token' (token rejected)."""
+    req = urllib.request.Request(f"https://huggingface.co/{MODEL}/resolve/main/model_index.json",
+                                 method="HEAD", headers={"Authorization": f"Bearer {tok}"})
+    for path in ("model_index.json", "modular_model_index.json"):
+        req.full_url = f"https://huggingface.co/{MODEL}/resolve/main/{path}"
+        try:
+            urllib.request.urlopen(req, timeout=20)
+            return "ok"
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                return "token"
+            if e.code == 403:
+                return "license"
+    return "ok"  # 404 on both names means access was granted but the layout changed: let the VM try
+
+
+def cmd_login(_args) -> int:
+    if not shutil.which("colab"):
+        raise FluxxError("Colab CLI not installed: run install.sh first")
+    if COLAB_TOKEN.exists():
+        print("Google (Colab): already signed in.")
+    else:
+        print("Google (Colab): a browser opens for sign-in. On a server, open the printed link anywhere "
+              "and paste the code back here.")
+        subprocess.run(["colab", "usage"], env=colab_env())
+    tok = hf_token()
+    if tok and hf_access(tok) == "ok":
+        print("Hugging Face: token saved and FLUX 3 license accepted.")
+        return 0
+    print(f"\nHugging Face, two steps (free):\n"
+          f"  1. Open https://huggingface.co/{MODEL} , sign in, and accept the FLUX license.\n"
+          f"  2. Create a Read token at https://huggingface.co/settings/tokens and paste it below.\n")
+    while True:
+        tok = getpass.getpass("Hugging Face token (input hidden, empty to skip): ").strip()
+        if not tok:
+            print("Skipped. Run `fluxx login` again when ready.")
+            return 1
+        state = hf_access(tok)
+        if state == "token":
+            print("That token was rejected. Copy it again from https://huggingface.co/settings/tokens")
+            continue
+        HF_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        HF_TOKEN_FILE.write_text(tok)
+        HF_TOKEN_FILE.chmod(0o600)
+        if state == "license":
+            print(f"Token saved, but the license is not accepted yet: open https://huggingface.co/{MODEL} "
+                  f"and click agree, then run `fluxx doctor`.")
+            return 1
+        print(f"Token saved to {HF_TOKEN_FILE} and FLUX 3 access confirmed.")
+        return 0
+
+
+def cmd_doctor(_args) -> int:
+    rows, ok = [], True
+
+    def row(good: bool, what: str, fix: str = "") -> None:
+        nonlocal ok
+        ok &= good
+        rows.append(f"{'ok  ' if good else 'TODO'} {what}" + ("" if good else f"\n     -> {fix}"))
+
+    row(bool(shutil.which("colab")), "Colab CLI installed", "run install.sh (or: uv tool install google-colab-cli)")
+    row(COLAB_TOKEN.exists(), "signed in to Google for Colab", "fluxx login")
+    if COLAB_TOKEN.exists() and shutil.which("colab"):
+        u = colab("usage", check=False, timeout=60).stdout
+        m = re.search(r"balance[^\d]*([\d.]+)", u, re.I)
+        row(not m or float(m.group(1)) > 1, f"Colab compute units: {m.group(1) if m else 'unknown'}",
+            "buy compute units or Colab Pro: https://colab.research.google.com/signup")
+    tok = hf_token()
+    state = hf_access(tok) if tok else "none"
+    row(state == "ok", "Hugging Face token with FLUX 3 license accepted",
+        "fluxx login" if state in ("none", "token") else f"accept the license at https://huggingface.co/{MODEL}")
+    brands = sorted(p.parent.name for p in (HOME / "brands").glob("*/brand.json"))
+    row(bool(brands), f"brands: {', '.join(brands) or 'none'}", "fluxx brand new NAME (the skill walks you through it)")
+    print("\n".join(rows))
+    print("\nready" if ok else "\nnot ready yet: fix the TODO lines above")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- brand commands
+
+def cmd_brand(args) -> int:
+    if args.action == "list":
+        for p in sorted((HOME / "brands").glob("*/brand.json")):
+            b = json.loads(p.read_text())
+            print(f"{p.parent.name}: {b.get('business', '')}")
+        return 0
+    d = brand_dir(args.name)
+    if args.action == "new":
+        if (d / "brand.json").exists():
+            raise FluxxError(f"brand '{args.name}' exists: edit {d / 'brand.json'}")
+        (d / "refs").mkdir(parents=True, exist_ok=True)
+        save_brand(args.name, {"business": args.business or "", "style": args.style or "",
+                               "avoid": args.avoid or "", "aspect": args.aspect or "1:1",
+                               "seed": int.from_bytes(os.urandom(3), "big"), "refs": [], "notes": []})
+        print(d / "brand.json")
+        return 0
+    b = load_brand(args.name)
+    if args.action == "ref":
+        src = Path(args.image).expanduser()
+        if not src.is_file():
+            raise FluxxError(f"no such image: {src}")
+        if len(b["refs"]) >= MAX_REFS:
+            raise FluxxError(f"FLUX 3 takes at most {MAX_REFS} references; remove one from brand.json first")
+        dst = d / "refs" / src.name
+        shutil.copy2(src, dst)
+        b["refs"].append({"path": str(dst), "role": args.role})
+        save_brand(args.name, b)
+        print(f"added {dst} as {args.role} reference ({len(b['refs'])}/{MAX_REFS})")
+        return 0
+    # show: the profile plus recent feedback, which is what an agent reads before writing shots
+    print(f"# {d / 'brand.json'}\n{json.dumps(b, indent=1)}")
+    rated = [h for h in history(args.name) if "verdict" in h][-15:]
+    shots = {h["id"]: h for h in history(args.name) if "scene" in h}
+    if rated:
+        print("\n# recent feedback")
+        for r in rated:
+            s = shots.get(r["rate"], {})
+            print(f"{r['verdict']:4} {r['rate']}: {s.get('scene', '')[:80]}" + (f"  -- {r['note']}" if r.get("note") else ""))
+    print(f"\n{sum(1 for h in shots.values() if 'md' in h)} shots so far in {d / 'shots'}")
+    return 0
+
+
+def cmd_rate(args) -> int:
+    key = Path(args.shot).name.removesuffix("_hd.png").removesuffix("_md.jpg")
+    for hist in (HOME / "brands").glob("*/history.jsonl"):
+        name = hist.parent.name
+        recs = [h for h in history(name) if "scene" in h and (h["id"] == key or key in h["id"])]
+        if recs:
+            r = recs[-1]
+            append_history(name, [{"rate": r["id"], "verdict": args.verdict, "note": args.note or "",
+                                   "time": time.strftime("%Y-%m-%dT%H:%M:%S")}])
+            print(f"{args.verdict}: {r['id']} ({name})")
+            return 0
+    raise FluxxError(f"no shot matching '{args.shot}'")
+
+
+# ---------------------------------------------------------------- generate
+
+def plan_shots(args, brand: dict) -> tuple[list[dict], list[dict]]:
+    scenes = list(args.scenes)
+    if args.from_file:
+        scenes += [s.strip() for s in Path(args.from_file).read_text().splitlines()
+                   if s.strip() and not s.lstrip().startswith("#")]
+    if not scenes:
+        raise FluxxError("no scenes: pass them as arguments or with --from FILE (one per line)")
+    refs = list(brand.get("refs", [])) + [{"path": str(Path(p).expanduser()), "role": "product"} for p in args.ref]
+    if args.no_refs:
+        refs = []
+    if len(refs) > MAX_REFS:
+        raise FluxxError(f"{len(refs)} references; FLUX 3 takes at most {MAX_REFS}")
+    for r in refs:
+        if not Path(r["path"]).is_file():
+            raise FluxxError(f"reference image missing: {r['path']}")
+    aspect = args.aspect or brand.get("aspect") or "1:1"
+    w, h = size_for(aspect, DRAFT_MP if args.draft else HD_MP)
+    seed = args.seed if args.seed is not None else int(brand.get("seed", 0))
+    remote = {r["path"]: f"{REMOTE}/refs/{i}{Path(r['path']).suffix.lower()}" for i, r in enumerate(refs)}
+    shots = []
+    for i, scene in enumerate(scenes):
+        for k in range(args.n):
+            shots.append({"id": f"{i + 1:02d}-{slug(scene)}-v{k + 1}", "scene": scene,
+                          "request": compose(scene, brand, refs), "seed": seed + k, "width": w, "height": h,
+                          "draft": args.draft, "refs": [remote[r["path"]] for r in refs], "aspect": aspect})
+    return shots, [{"local": p, "remote": rp} for p, rp in remote.items()]
+
+
+def cmd_gen(args) -> int:
+    brand = load_brand(args.brand)
+    shots, uploads = plan_shots(args, brand)
+    tok = hf_token()
+    if not tok:
+        raise FluxxError("no Hugging Face token: run `fluxx login`")
+    if (state := hf_access(tok)) != "ok":
+        raise FluxxError("Hugging Face token rejected: run `fluxx login`" if state == "token" else
+                         f"accept the FLUX 3 license first: https://huggingface.co/{MODEL}")
+    out = Path(args.out).expanduser() if args.out else brand_dir(args.brand) / "shots" / time.strftime("%Y%m%d-%H%M%S")
+    out.mkdir(parents=True, exist_ok=True)
+    spec = {"model": MODEL, "upsample": not args.no_upsample, "md_side": MD_SIDE, "shots": shots}
+    log(f"{len(shots)} shot(s) at {shots[0]['width']}x{shots[0]['height']}, {len(uploads)} reference(s) -> {out}")
+
+    with tempfile.TemporaryDirectory() as tmp, gpu_session(args) as info:
+        sp, tp = Path(tmp) / "spec.json", Path(tmp) / "hf_token"
+        sp.write_text(json.dumps(spec))
+        tp.write_text(tok)
+        tp.chmod(0o600)
+        rexec(args.session, f'import os\nos.makedirs("{REMOTE}/refs", exist_ok=True)\n'
+                            'print(BEGIN); print("{}"); print(END)', 60)
+        for local, remote in [(str(HERE / "remote_job.py"), f"{REMOTE}/remote_job.py"),
+                              (str(sp), f"{REMOTE}/spec.json"), (str(tp), f"{REMOTE}/hf_token")] + \
+                             [(u["local"], u["remote"]) for u in uploads]:
+            colab("upload", "-s", args.session, local, remote, timeout=300)
+        rexec(args.session, LAUNCH, 60)
+        log("job started on the VM: installing, downloading FLUX 3 Klein (~40 GB) and loading it")
+        last, misses, deadline = None, 0, time.time() + args.max_minutes * 60 - 120
+        while time.time() < deadline:
+            time.sleep(15)
+            try:
+                st = rexec(args.session, POLL, 60)
+                misses = 0
+            except FluxxError:
+                misses += 1  # a dropped websocket: try again
+                if misses >= 8:
+                    raise
+                continue
+            line = st["stage"] + (f" {st['done']}/{st['total']}" if "total" in st else "")
+            if line != last:
+                log(line + (f" (model ready after {st['ready_s']}s)" if st.get("ready_s") and st.get("done") == 0 else ""))
+                last = line
+            if st["stage"] == "failed":
+                raise FluxxError("the job failed on the VM:\n" + (st.get("log") or st.get("error", "")))
+            if st["stage"] == "finished":
+                break
+        else:
+            raise FluxxError(f"not finished within --max-minutes {args.max_minutes:g}; nothing downloaded")
+        zp = Path(tmp) / "out.zip"
+        for attempt in range(3):
+            if colab("download", "-s", args.session, f"{REMOTE}/out.zip", str(zp), check=False, timeout=900).returncode == 0 \
+                    and zipfile.is_zipfile(zp):
+                break
+            time.sleep(3)
+        else:
+            raise FluxxError("could not download the pictures from the VM")
+        with zipfile.ZipFile(zp) as z:
+            z.extractall(out)
+
+    manifest = json.loads((out / "manifest.json").read_text())
+    now, recs, failed = time.strftime("%Y-%m-%dT%H:%M:%S"), [], 0
+    by_id = {s["id"]: s for s in shots}
+    for r in manifest["shots"]:
+        rec = {"id": r["id"], "time": now, "scene": r["scene"], "caption": r.get("caption", ""), "seed": r["seed"],
+               "aspect": by_id[r["id"]]["aspect"], "size": f"{r['width']}x{r['height']}"}
+        for k in ("hd", "md"):
+            if r.get(k):
+                rec[k] = str(out / r[k])
+        if r.get("error"):
+            rec["error"] = r["error"]
+            failed += 1
+            log(f"{r['id']}: FAILED {r['error'][:200]}")
+        recs.append(rec)
+        if "md" in rec:
+            print(rec.get("hd") or rec["md"])
+    append_history(args.brand, recs)
+    log(f"{len(recs) - failed}/{len(recs)} pictures on {manifest.get('gpu', '?')}, model ready after "
+        f"{manifest.get('ready_s', '?')}s -> {out}")
+    return 1 if failed else 0
+
+
+def cmd_stop(args) -> int:
+    r = colab("stop", "-s", args.session, check=False)
+    print((r.stdout + r.stderr).strip())
+    _kill_watchdog(args.session)
+    return r.returncode
+
+
+def cmd_status(_args) -> int:
+    for sub in ("sessions", "usage"):
+        print((colab(sub, check=False, timeout=60).stdout).strip())
+    return 0
+
+
+def cmd_selftest(_args) -> int:
+    assert size_for("1:1", 4) == (2048, 2048)
+    assert size_for("1:1", 1) == (1024, 1024)
+    w, h = size_for("4:5", 4)
+    assert w % 32 == 0 and h % 32 == 0 and abs(w / h - 0.8) < 0.02 and 3.8e6 < w * h < 4.3e6
+    w, h = size_for("16:9", 4)
+    assert w > h and w % 32 == 0
+    for bad in ("square", "1:9"):
+        try:
+            size_for(bad, 4)
+            raise AssertionError(bad)
+        except FluxxError:
+            pass
+    req = compose("A candle on a marble table", {"business": "a candle shop", "style": "soft light", "avoid": "text"},
+                  [{"role": "product"}, {"role": "style"}])
+    assert req.startswith("A candle on a marble table. It is for a candle shop.") and "image 2 is a style" in req
+    assert compose("x", {}, []) == "x."
+    assert slug("Hero shot: on oak!") == "hero-shot-on-oak"
+    assert payload(f"noise\n{BEGIN}\n{{\"a\": 1}}\n{END}") == {"a": 1}
+    try:
+        payload("Traceback: boom")
+        raise AssertionError("missing marker must raise")
+    except FluxxError as e:
+        assert "boom" in str(e)
+    try:
+        brand_dir("Bad Name")
+        raise AssertionError("bad brand name accepted")
+    except FluxxError:
+        pass
+    compile((HERE / "remote_job.py").read_text(), "remote_job.py", "exec")
+    for code in (LAUNCH, POLL):
+        compile(f"BEGIN=END=''\nimport json\n{code}", "remote", "exec")
+    print("selftest ok")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="fluxx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("login", help="Google sign-in for Colab + Hugging Face token").set_defaults(fn=cmd_login)
+    sub.add_parser("doctor", help="what is set up, what is missing").set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("brand", help="brand profiles: new, ref, show, list")
+    p.add_argument("action", choices=("new", "ref", "show", "list"))
+    p.add_argument("name", nargs="?")
+    p.add_argument("image", nargs="?", help="for `ref`: the picture to add")
+    p.add_argument("--role", choices=tuple(ROLES), default="product")
+    p.add_argument("--business")
+    p.add_argument("--style")
+    p.add_argument("--avoid")
+    p.add_argument("--aspect")
+    p.set_defaults(fn=cmd_brand)
+
+    p = sub.add_parser("gen", help="render shots in one GPU session")
+    p.add_argument("-b", "--brand", required=True)
+    p.add_argument("scenes", nargs="*", help="one scene per argument")
+    p.add_argument("--from", dest="from_file", help="file with one scene per line")
+    p.add_argument("-n", type=int, default=1, help="variations per scene (seed, seed+1, ...)")
+    p.add_argument("--aspect", help="W:H, default the brand's")
+    p.add_argument("--draft", action="store_true", help="1 MP medium only: faster, for exploring")
+    p.add_argument("--ref", action="append", default=[], help="extra product reference for this run")
+    p.add_argument("--no-refs", action="store_true", help="ignore the brand's references")
+    p.add_argument("--seed", type=int, help="default the brand's seed, for consistency")
+    p.add_argument("--no-upsample", action="store_true",
+                   help="scenes are complete captions: skip FLUX 3's prompt upsampler (saves a 19 GB download)")
+    p.add_argument("--out", help="output folder (default ~/colab-flux/brands/NAME/shots/<time>)")
+    p.add_argument("-s", "--session", default="flux-gpu")
+    p.add_argument("--gpu", default=os.environ.get("FLUXX_GPU", "A100"))
+    p.add_argument("--high-mem", action=argparse.BooleanOptionalAction, default=True,
+                   help="on A100 this is the 80 GB card (default); the model plus upsampler need ~40 GB")
+    p.add_argument("--max-minutes", type=float, default=60)
+    p.set_defaults(fn=cmd_gen)
+
+    p = sub.add_parser("rate", help="good/bad feedback on a shot")
+    p.add_argument("shot", help="shot id or picture path")
+    p.add_argument("verdict", choices=("good", "bad"))
+    p.add_argument("note", nargs="?")
+    p.set_defaults(fn=cmd_rate)
+
+    for name, fn in (("stop", cmd_stop), ("status", cmd_status), ("selftest", cmd_selftest)):
+        p = sub.add_parser(name)
+        p.add_argument("-s", "--session", default="flux-gpu")
+        p.set_defaults(fn=fn)
+
+    args = ap.parse_args()
+    if args.cmd == "brand" and args.action != "list" and not args.name:
+        ap.error("brand NAME is required")
+    if args.cmd == "gen" and not 1 <= args.n <= 16:
+        ap.error("-n must be 1..16")
+    try:
+        return args.fn(args)
+    except FluxxError as e:
+        log(f"error: {e}")
+        return 1
+    except KeyboardInterrupt:
+        log("interrupted; see the stop line above")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
