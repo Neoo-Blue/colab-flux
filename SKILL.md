@@ -50,7 +50,9 @@ Ask these in **one** message, short, with examples so it takes a minute to answe
 4. Anything that must never appear? (people, text, competitor items, clutter, certain colors)
 5. Photos of the product: file paths or drag them in. A plain, well-lit photo per product works best.
 
-Then turn the answers into the profile. Translate adjectives into words a photographer would
+Then turn the answers into the profile. Write `--business` as a description, not the brand name
+("an after-hours AI receptionist for small local businesses", not "Cooli AI"): the business line goes into
+every prompt, and FLUX paints a name it sees onto vans, signs, screens and boxes in the scene. Translate adjectives into words a photographer would
 use, because that is what FLUX follows. "Calm and warm" becomes "soft diffused window light from
 the left, warm neutral palette of oat, sand and terracotta, matte linen and pale oak surfaces,
 shallow depth of field, generous negative space, editorial product photography".
