@@ -267,6 +267,48 @@ def warm_alive(session: str, mode: dict) -> bool:
         return False
 
 
+BUSY = re.compile(r"unavailable|\b503\b|capacity|try again later|exhausted", re.I)
+
+
+def allocate(args) -> tuple[str, dict]:
+    """The first card of the --gpu ladder that Colab assigns and that holds the pipeline. When every card is busy,
+    go round again after 30 s, doubling to 10 min, until one is free (or --wait-minutes passes). A card that fails
+    for another reason (not on this plan, too small) is skipped; if no card was merely busy, the run stops."""
+    gpus = [g.strip() for g in args.gpu.split(",") if g.strip()] or ["A100"]
+    deadline = time.time() + args.wait_minutes * 60 if args.wait_minutes else float("inf")
+    pause, t0, rounds = 30, time.time(), 0
+    while True:
+        busy, why = False, ""
+        rounds += 1
+        for gpu in gpus:
+            colab("stop", "-s", args.session, check=False, timeout=90)
+            log(f"allocating {gpu} as session '{args.session}'")
+            hm = args.high_mem and gpu.upper() in ("A100", "T4")
+            try:
+                colab("new", "-s", args.session, "--gpu", gpu, *(["--high-mem"] if hm else []), timeout=600)
+            except FluxxError as e:
+                why = str(e).strip().splitlines()[-1][-160:]
+                busy = busy or bool(BUSY.search(str(e)))
+                log(f"{gpu} not available ({why})")
+                continue
+            arm_watchdog(args.session, args.max_minutes * 60)  # fresh cap, whatever the wait took
+            v = rexec(args.session, VRAM, 60)
+            if v["gb"] >= NEED_GB:
+                if rounds > 1:
+                    log(f"got {gpu} after {(time.time() - t0) / 60:.0f} min of retries")
+                return gpu, v
+            why = f"{v['name']} has {v['gb']:.0f} GB, the pipeline needs {NEED_GB}"
+            log(f"{gpu} skipped: {why}")
+        colab("stop", "-s", args.session, check=False, timeout=90)
+        if not busy:
+            raise FluxxError(f"no card in --gpu {args.gpu} can run this ({why})")
+        if time.time() + pause > deadline:
+            raise FluxxError(f"every card in --gpu {args.gpu} stayed busy for {args.wait_minutes:g} min")
+        log(f"no card is free; round {rounds + 1} in {pause} s (Ctrl-C gives up; --wait-minutes caps it)")
+        time.sleep(pause)
+        pause = min(pause * 2, 600)
+
+
 @contextlib.contextmanager
 def gpu_session(args, mode: dict):
     """A GPU for the block: a warm one from an earlier run when it matches, else a new one. Afterwards it is
@@ -288,22 +330,9 @@ def gpu_session(args, mode: dict):
         if info["warm"]:
             log(f"reusing the warm GPU '{args.session}': FLUX 3 is already loaded")
         else:
-            gpus = [g.strip() for g in args.gpu.split(",") if g.strip()] or ["A100"]
-            for i, gpu in enumerate(gpus):  # in order: a busy card ("Service Unavailable") falls through
-                colab("stop", "-s", args.session, check=False, timeout=90)
-                log(f"allocating {gpu} as session '{args.session}' (watchdog stops it at {args.max_minutes:g} min)")
-                hm = args.high_mem and gpu.upper() in ("A100", "T4")
-                try:
-                    colab("new", "-s", args.session, "--gpu", gpu, *(["--high-mem"] if hm else []), timeout=600)
-                    v = rexec(args.session, VRAM, 60)
-                    if v["gb"] < NEED_GB:
-                        raise FluxxError(f"{v['name']} has {v['gb']:.0f} GB, the pipeline needs {NEED_GB}")
-                    break
-                except FluxxError as e:
-                    if i == len(gpus) - 1:
-                        raise
-                    log(f"{gpu} not usable ({str(e).splitlines()[-1][-160:]}); trying {gpus[i + 1]}")
-            log(f"VM up on {gpu} ({v['name']}, {v['gb']:.0f} GB) in {time.time() - t0:.0f}s")
+            gpu, v = allocate(args)
+            t0 = time.time()  # bill from here: waiting for a free card costs nothing
+            log(f"VM up on {gpu} ({v['name']}, {v['gb']:.0f} GB)")
         m = re.search(r"Usage rate:\s*([\d.]+)", colab("usage", check=False, timeout=60).stdout)
         info["rate"] = float(m.group(1)) if m else None
         yield info
@@ -894,6 +923,8 @@ def main() -> int:
     p.add_argument("--high-mem", action=argparse.BooleanOptionalAction, default=True,
                    help="on A100 this is the 80 GB card (default); the model plus upsampler need ~40 GB")
     p.add_argument("--max-minutes", type=float, default=60, help="hard cap for this run (watchdog)")
+    p.add_argument("--wait-minutes", type=float, default=0,
+                   help="when every GPU is busy, retry for at most this long (default 0 = until one is free)")
     p.add_argument("--keep", type=float, help="minutes to keep the GPU warm afterwards for a follow-up run "
                                             "(default: config keep_minutes, 5; 0 = stop at once)")
     p.add_argument("--candidates", type=int, help="renders per shot; the judge keeps the best "
@@ -913,6 +944,7 @@ def main() -> int:
                   ("--gpu", {"default": os.environ.get("FLUXX_GPU", GPU_LADDER)}),
                   ("--high-mem", {"action": argparse.BooleanOptionalAction, "default": True}),
                   ("--max-minutes", {"type": float, "default": 60}), ("--keep", {"type": float}),
+                  ("--wait-minutes", {"type": float, "default": 0}),
                   ("--candidates", {"type": int})):
         p.add_argument(a, **kw)
     p.set_defaults(fn=cmd_listing)
