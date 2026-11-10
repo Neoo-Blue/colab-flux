@@ -206,6 +206,16 @@ import os, time
 p = "{REMOTE}/heartbeat"
 print(BEGIN); print(json.dumps({{"age": time.time() - float(open(p).read()) if os.path.exists(p) else 1e9}})); print(END)
 '''
+VRAM = '''
+import subprocess
+out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                     capture_output=True, text=True).stdout.strip().splitlines()
+name, mib = (out[0].rsplit(",", 1) if out else ("none", "0"))
+print(BEGIN); print(json.dumps({"name": name.strip(), "gb": int(mib) / 1024})); print(END)
+'''
+NEED_GB = 60  # FLUX 3 + prompt upsampler + judge peak ~56 GB measured on the A100 80 GB
+# Best to worst of the Colab cards; T4 (16 GB) and L4 (24 GB) cannot hold the pipeline.
+GPU_LADDER = "H100,G4,A100"
 CONFIG_DEFAULTS = {"keep_minutes": 5, "candidates": 3}
 
 
@@ -285,12 +295,15 @@ def gpu_session(args, mode: dict):
                 hm = args.high_mem and gpu.upper() in ("A100", "T4")
                 try:
                     colab("new", "-s", args.session, "--gpu", gpu, *(["--high-mem"] if hm else []), timeout=600)
+                    v = rexec(args.session, VRAM, 60)
+                    if v["gb"] < NEED_GB:
+                        raise FluxxError(f"{v['name']} has {v['gb']:.0f} GB, the pipeline needs {NEED_GB}")
                     break
                 except FluxxError as e:
                     if i == len(gpus) - 1:
                         raise
-                    log(f"{gpu} not available ({str(e).splitlines()[-1][-160:]}); trying {gpus[i + 1]}")
-            log(f"VM up on {gpu} in {time.time() - t0:.0f}s")
+                    log(f"{gpu} not usable ({str(e).splitlines()[-1][-160:]}); trying {gpus[i + 1]}")
+            log(f"VM up on {gpu} ({v['name']}, {v['gb']:.0f} GB) in {time.time() - t0:.0f}s")
         m = re.search(r"Usage rate:\s*([\d.]+)", colab("usage", check=False, timeout=60).stdout)
         info["rate"] = float(m.group(1)) if m else None
         yield info
@@ -876,8 +889,8 @@ def main() -> int:
                    help="scenes are complete captions: skip FLUX 3's prompt upsampler (saves a 19 GB download)")
     p.add_argument("--out", help="output folder (default ~/colab-flux/brands/NAME/shots/<time>)")
     p.add_argument("-s", "--session", default="flux-gpu")
-    p.add_argument("--gpu", default=os.environ.get("FLUXX_GPU", "A100,H100"),
-                   help="GPU, or a comma list tried in order when one is busy (default A100,H100, both 80 GB)")
+    p.add_argument("--gpu", default=os.environ.get("FLUXX_GPU", GPU_LADDER),
+                   help="GPU, or a comma list tried best first when one is busy or too small (default H100,G4,A100)")
     p.add_argument("--high-mem", action=argparse.BooleanOptionalAction, default=True,
                    help="on A100 this is the 80 GB card (default); the model plus upsampler need ~40 GB")
     p.add_argument("--max-minutes", type=float, default=60, help="hard cap for this run (watchdog)")
@@ -897,7 +910,7 @@ def main() -> int:
     p.add_argument("--no-refs", action="store_true", help="ignore the brand's references (another product)")
     for a, kw in (("--draft", {"action": "store_true"}), ("--seed", {"type": int}), ("--out", {}),
                   ("--no-upsample", {"action": "store_true"}), ("-s", {"dest": "session", "default": "flux-gpu"}),
-                  ("--gpu", {"default": os.environ.get("FLUXX_GPU", "A100,H100")}),
+                  ("--gpu", {"default": os.environ.get("FLUXX_GPU", GPU_LADDER)}),
                   ("--high-mem", {"action": argparse.BooleanOptionalAction, "default": True}),
                   ("--max-minutes", {"type": float, "default": 60}), ("--keep", {"type": float}),
                   ("--candidates", {"type": int})):
