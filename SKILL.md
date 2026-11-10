@@ -86,6 +86,8 @@ Show the person the profile you wrote (`fluxx brand show NAME`) and ask if it so
    A cold start takes ~4 minutes, then ~45 s per 4 MP render. In Claude Code run it with
    `run_in_background`; in Codex let it run. It prints one picture path per line on stdout;
    progress, each shot's judge score and defects, and the compute-unit cost go to stderr.
+   Place things with plain words ("near the top", "on the left"). Never write "upper half of the frame" or
+   "the top half": FLUX then draws two stacked scenes, and in testing the judge passed all three of them.
    When a person is in a scene using the product, say how: "holding the phone's handset to her
    ear, its cord trailing out of frame; the phone base not visible". FLUX draws the product the way
    the reference shows it, so a lifted part tends to appear twice (in testing, a held handset plus
