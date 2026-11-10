@@ -105,7 +105,7 @@ Show the person the profile you wrote (`fluxx brand show NAME`) and ask if it so
    `--keep 15` on the next run, or save a new default with `fluxx config keep_minutes 15`.
    `--keep 0` stops the GPU at the end of the run.
 
-Flags: `--gpu H100,G4,A100` cards to try, best first, retried until one is free · `--wait-minutes N` stop retrying after N minutes · `-n N` variations per scene (seeds seed..seed+N-1) · `--candidates K` renders per shot, best
+Flags: `--gpu H100,G4,A100` cards to try, best first, retried until one is free · `--retry-schedule 30s,5m,1h` waits between rounds · `--wait-minutes N` stop retrying after N minutes · `-n N` variations per scene (seeds seed..seed+N-1) · `--candidates K` renders per shot, best
 kept (1-8) · `--keep MIN` warm minutes afterwards · `--draft` 1 MP medium only, one candidate,
 faster, for exploring a new direction · `--aspect W:H` · `--ref PATH` one-off extra product photo ·
 `--no-refs` · `--seed S` · `--no-upsample` when the scenes are already full captions (skips a
@@ -206,7 +206,7 @@ fluxx brand new|show|list|ref ...  # brand profiles
 fluxx gen -b NAME [...] scenes...  # render (reuses a warm GPU)
 fluxx listing -b NAME --product .. --notes .. [--for amazon,etsy,ebay,shopify]  # marketplace pack
 fluxx rate SHOT good|bad "why"     # feedback
-fluxx config [keep_minutes|candidates N]   # defaults: 5 warm minutes, 3 candidates
+fluxx config [keep_minutes|candidates|retry_schedule VALUE]   # defaults: 5 warm minutes, 3 candidates, 30s..2h retries
 fluxx status                       # Colab sessions and compute-unit balance
 fluxx stop                         # stop a leftover GPU session (always safe)
 fluxx selftest                     # offline check, no Colab call
@@ -214,8 +214,10 @@ fluxx selftest                     # offline check, no Colab call
 
 Environment: `COLAB_FLUX_HOME` (default `~/colab-flux`), `FLUXX_GPU` (default `H100,G4,A100`: best
 to worst, tried in order. A card Colab answers "Service Unavailable" for, or one with under 60 GB of
-GPU memory (checked with nvidia-smi on the VM, then stopped), is skipped for the next. When every card is busy, `fluxx` waits and goes round the list again (30 s,
-doubling to 10 min between rounds) until one is free: a run started at a busy hour simply starts later.
-`--wait-minutes N` caps the waiting; a card refused for another reason (not on the plan) never loops. The pipeline peaks
+GPU memory (checked with nvidia-smi on the VM, then stopped), is skipped for the next. When every card is busy, `fluxx` waits and goes round the list again until one
+is free, so a run started at a busy hour simply starts later. The waits follow the retry schedule, by
+default `30s,1m,5m,10m,20m,30m,1h,1h15m,1h30m,1h45m,2h` (the last wait repeats); change it for good with
+`fluxx config retry_schedule "1m,10m,1h"` or for one run with `--retry-schedule`. `--wait-minutes N` caps
+the total waiting; a card refused for another reason (not on the plan) never loops. The pipeline peaks
 at ~56 GB, so T4 and L4 never qualify. `--gpu` sets it per run, e.g. `--gpu A100` to save compute
 units: faster cards cost more per hour), `FLUXX_MODEL`, `FLUXX_MIRROR` (empty disables the mirror), `HF_TOKEN`.

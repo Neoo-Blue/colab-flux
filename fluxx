@@ -216,7 +216,20 @@ print(BEGIN); print(json.dumps({"name": name.strip(), "gb": int(mib) / 1024})); 
 NEED_GB = 60  # FLUX 3 + prompt upsampler + judge peak ~56 GB measured on the A100 80 GB
 # Best to worst of the Colab cards; T4 (16 GB) and L4 (24 GB) cannot hold the pipeline.
 GPU_LADDER = "H100,G4,A100"
-CONFIG_DEFAULTS = {"keep_minutes": 5, "candidates": 3}
+CONFIG_DEFAULTS = {"keep_minutes": 5, "candidates": 3,
+                   "retry_schedule": "30s,1m,5m,10m,20m,30m,1h,1h15m,1h30m,1h45m,2h"}
+
+
+def parse_schedule(text: str) -> list[float]:
+    """'30s,1m,1h15m' -> seconds per wait; the last one repeats until a card is free."""
+    out = []
+    for part in str(text).replace(" ", "").split(","):
+        m = re.fullmatch(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?", part)
+        if not part or not m or not any(m.groups()):
+            raise FluxxError(f"retry schedule: can't read {part!r}; use e.g. 30s,1m,5m,1h,1h15m")
+        h, mi, se = (float(g or 0) for g in m.groups())
+        out.append(h * 3600 + mi * 60 + se)
+    return out
 
 
 def config() -> dict:
@@ -272,11 +285,12 @@ BUSY = re.compile(r"unavailable|\b503\b|capacity|try again later|exhausted", re.
 
 def allocate(args) -> tuple[str, dict]:
     """The first card of the --gpu ladder that Colab assigns and that holds the pipeline. When every card is busy,
-    go round again after 30 s, doubling to 10 min, until one is free (or --wait-minutes passes). A card that fails
+    go round again after each wait of the retry schedule (its last wait repeats) until one is free (or
+    --wait-minutes passes). A card that fails
     for another reason (not on this plan, too small) is skipped; if no card was merely busy, the run stops."""
     gpus = [g.strip() for g in args.gpu.split(",") if g.strip()] or ["A100"]
     deadline = time.time() + args.wait_minutes * 60 if args.wait_minutes else float("inf")
-    pause, t0, rounds = 30, time.time(), 0
+    waits, t0, rounds = parse_schedule(args.retry_schedule or config()["retry_schedule"]), time.time(), 0
     while True:
         busy, why = False, ""
         rounds += 1
@@ -302,11 +316,12 @@ def allocate(args) -> tuple[str, dict]:
         colab("stop", "-s", args.session, check=False, timeout=90)
         if not busy:
             raise FluxxError(f"no card in --gpu {args.gpu} can run this ({why})")
+        pause = waits[min(rounds - 1, len(waits) - 1)]
         if time.time() + pause > deadline:
             raise FluxxError(f"every card in --gpu {args.gpu} stayed busy for {args.wait_minutes:g} min")
-        log(f"no card is free; round {rounds + 1} in {pause} s (Ctrl-C gives up; --wait-minutes caps it)")
+        nice = f"{pause / 3600:g} h" if pause >= 3600 else f"{pause / 60:g} min" if pause >= 60 else f"{pause:g} s"
+        log(f"no card is free; round {rounds + 1} in {nice} (Ctrl-C gives up; --wait-minutes caps it)")
         time.sleep(pause)
-        pause = min(pause * 2, 600)
 
 
 @contextlib.contextmanager
@@ -809,9 +824,17 @@ def cmd_gen(args) -> int:
 def cmd_config(args) -> int:
     cfg = config()
     if args.key and args.value is not None:
-        if args.value < 0 or (args.key == "candidates" and not 1 <= args.value <= 8):
-            raise FluxxError("keep_minutes >= 0; candidates 1..8")
-        cfg[args.key] = int(args.value) if args.value == int(args.value) else args.value
+        if args.key == "retry_schedule":
+            parse_schedule(args.value)
+            cfg[args.key] = args.value
+        else:
+            try:
+                v = float(args.value)
+            except ValueError:
+                raise FluxxError(f"{args.key} takes a number")
+            if v < 0 or (args.key == "candidates" and not 1 <= v <= 8):
+                raise FluxxError("keep_minutes >= 0; candidates 1..8")
+            cfg[args.key] = int(v) if v == int(v) else v
         HOME.mkdir(parents=True, exist_ok=True)
         (HOME / "config.json").write_text(json.dumps(cfg, indent=1) + "\n")
     print(json.dumps({k: cfg[k] for k in ([args.key] if args.key else cfg)}, indent=1))
@@ -925,6 +948,8 @@ def main() -> int:
     p.add_argument("--max-minutes", type=float, default=60, help="hard cap for this run (watchdog)")
     p.add_argument("--wait-minutes", type=float, default=0,
                    help="when every GPU is busy, retry for at most this long (default 0 = until one is free)")
+    p.add_argument("--retry-schedule", help="waits between rounds when every GPU is busy, e.g. 30s,1m,5m,1h; "
+                                            "the last repeats (default: config retry_schedule)")
     p.add_argument("--keep", type=float, help="minutes to keep the GPU warm afterwards for a follow-up run "
                                             "(default: config keep_minutes, 5; 0 = stop at once)")
     p.add_argument("--candidates", type=int, help="renders per shot; the judge keeps the best "
@@ -944,14 +969,14 @@ def main() -> int:
                   ("--gpu", {"default": os.environ.get("FLUXX_GPU", GPU_LADDER)}),
                   ("--high-mem", {"action": argparse.BooleanOptionalAction, "default": True}),
                   ("--max-minutes", {"type": float, "default": 60}), ("--keep", {"type": float}),
-                  ("--wait-minutes", {"type": float, "default": 0}),
+                  ("--wait-minutes", {"type": float, "default": 0}), ("--retry-schedule", {}),
                   ("--candidates", {"type": int})):
         p.add_argument(a, **kw)
     p.set_defaults(fn=cmd_listing)
 
-    p = sub.add_parser("config", help="show or set defaults: keep_minutes, candidates")
+    p = sub.add_parser("config", help="show or set defaults: keep_minutes, candidates, retry_schedule")
     p.add_argument("key", nargs="?", choices=tuple(CONFIG_DEFAULTS))
-    p.add_argument("value", nargs="?", type=float)
+    p.add_argument("value", nargs="?")
     p.set_defaults(fn=cmd_config)
 
     p = sub.add_parser("rate", help="good/bad feedback on a shot")
