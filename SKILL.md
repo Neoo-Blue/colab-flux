@@ -5,7 +5,7 @@ description: Consistent product, brand and marketplace-listing pictures with FLU
 
 # colab-flux
 
-FLUX 3 Image Klein on a rented Colab GPU, driven by `fluxx`. A `fluxx gen` starts an A100 ->
+FLUX 3 Image Klein on a rented Colab GPU, driven by `fluxx`. A `fluxx gen` starts an A100 (or an H100 when no A100 is free) ->
 installs diffusers -> downloads and loads FLUX 3 and a judge model -> renders every shot (best of
 several, judged) -> downloads the pictures -> keeps the GPU warm for a few minutes for follow-ups,
 then stops it. Batch every shot you can into one call.
@@ -105,7 +105,7 @@ Show the person the profile you wrote (`fluxx brand show NAME`) and ask if it so
    `--keep 15` on the next run, or save a new default with `fluxx config keep_minutes 15`.
    `--keep 0` stops the GPU at the end of the run.
 
-Flags: `-n N` variations per scene (seeds seed..seed+N-1) · `--candidates K` renders per shot, best
+Flags: `--gpu A100,H100` cards to try in order when one is busy · `-n N` variations per scene (seeds seed..seed+N-1) · `--candidates K` renders per shot, best
 kept (1-8) · `--keep MIN` warm minutes afterwards · `--draft` 1 MP medium only, one candidate,
 faster, for exploring a new direction · `--aspect W:H` · `--ref PATH` one-off extra product photo ·
 `--no-refs` · `--seed S` · `--no-upsample` when the scenes are already full captions (skips a
@@ -212,5 +212,7 @@ fluxx stop                         # stop a leftover GPU session (always safe)
 fluxx selftest                     # offline check, no Colab call
 ```
 
-Environment: `COLAB_FLUX_HOME` (default `~/colab-flux`), `FLUXX_GPU` (default `A100`, the 80 GB
-card: FLUX 3, its prompt upsampler and the judge use about 60 GB), `FLUXX_MODEL`, `FLUXX_MIRROR` (empty disables the mirror), `HF_TOKEN`.
+Environment: `COLAB_FLUX_HOME` (default `~/colab-flux`), `FLUXX_GPU` (default `A100,H100`: tried
+in order, so when Colab answers "Service Unavailable" for the A100 the run moves to the H100; both are
+80 GB, and FLUX 3, its prompt upsampler and the judge use about 60 GB. `--gpu` sets it per run, e.g.
+`--gpu H100` or `--gpu A100,H100,G4`), `FLUXX_MODEL`, `FLUXX_MIRROR` (empty disables the mirror), `HF_TOKEN`.

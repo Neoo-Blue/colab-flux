@@ -278,11 +278,19 @@ def gpu_session(args, mode: dict):
         if info["warm"]:
             log(f"reusing the warm GPU '{args.session}': FLUX 3 is already loaded")
         else:
-            colab("stop", "-s", args.session, check=False, timeout=90)
-            log(f"allocating {args.gpu} as session '{args.session}' (watchdog stops it at {args.max_minutes:g} min)")
-            hm = args.high_mem and args.gpu.upper() in ("A100", "T4")
-            colab("new", "-s", args.session, "--gpu", args.gpu, *(["--high-mem"] if hm else []), timeout=600)
-            log(f"VM up in {time.time() - t0:.0f}s")
+            gpus = [g.strip() for g in args.gpu.split(",") if g.strip()] or ["A100"]
+            for i, gpu in enumerate(gpus):  # in order: a busy card ("Service Unavailable") falls through
+                colab("stop", "-s", args.session, check=False, timeout=90)
+                log(f"allocating {gpu} as session '{args.session}' (watchdog stops it at {args.max_minutes:g} min)")
+                hm = args.high_mem and gpu.upper() in ("A100", "T4")
+                try:
+                    colab("new", "-s", args.session, "--gpu", gpu, *(["--high-mem"] if hm else []), timeout=600)
+                    break
+                except FluxxError as e:
+                    if i == len(gpus) - 1:
+                        raise
+                    log(f"{gpu} not available ({str(e).splitlines()[-1][-160:]}); trying {gpus[i + 1]}")
+            log(f"VM up on {gpu} in {time.time() - t0:.0f}s")
         m = re.search(r"Usage rate:\s*([\d.]+)", colab("usage", check=False, timeout=60).stdout)
         info["rate"] = float(m.group(1)) if m else None
         yield info
@@ -868,7 +876,8 @@ def main() -> int:
                    help="scenes are complete captions: skip FLUX 3's prompt upsampler (saves a 19 GB download)")
     p.add_argument("--out", help="output folder (default ~/colab-flux/brands/NAME/shots/<time>)")
     p.add_argument("-s", "--session", default="flux-gpu")
-    p.add_argument("--gpu", default=os.environ.get("FLUXX_GPU", "A100"))
+    p.add_argument("--gpu", default=os.environ.get("FLUXX_GPU", "A100,H100"),
+                   help="GPU, or a comma list tried in order when one is busy (default A100,H100, both 80 GB)")
     p.add_argument("--high-mem", action=argparse.BooleanOptionalAction, default=True,
                    help="on A100 this is the 80 GB card (default); the model plus upsampler need ~40 GB")
     p.add_argument("--max-minutes", type=float, default=60, help="hard cap for this run (watchdog)")
@@ -888,7 +897,7 @@ def main() -> int:
     p.add_argument("--no-refs", action="store_true", help="ignore the brand's references (another product)")
     for a, kw in (("--draft", {"action": "store_true"}), ("--seed", {"type": int}), ("--out", {}),
                   ("--no-upsample", {"action": "store_true"}), ("-s", {"dest": "session", "default": "flux-gpu"}),
-                  ("--gpu", {"default": os.environ.get("FLUXX_GPU", "A100")}),
+                  ("--gpu", {"default": os.environ.get("FLUXX_GPU", "A100,H100")}),
                   ("--high-mem", {"action": argparse.BooleanOptionalAction, "default": True}),
                   ("--max-minutes", {"type": float, "default": 60}), ("--keep", {"type": float}),
                   ("--candidates", {"type": int})):

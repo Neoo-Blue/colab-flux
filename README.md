@@ -73,7 +73,7 @@ fluxx rate 01-the-jar-on-a-sunlit-windowsill-v1 good "love the light"
 
 ## How it works
 
-`fluxx gen` starts an A100 80 GB on Colab, uploads `remote_job.py`, your product photos and the
+`fluxx gen` starts an A100 80 GB on Colab (an H100 80 GB when no A100 is free; `--gpu` or `FLUXX_GPU` sets the order), uploads `remote_job.py`, your product photos and the
 shot list, and starts a worker: install diffusers, download FLUX 3 Image Klein (~11 GB), its
 Qwen3-VL text encoder, its 9B prompt upsampler and the Qwen3.5-9B judge (~60 GB in all, about 3
 minutes on Colab), then render every shot with the references and a fixed seed, judge each
